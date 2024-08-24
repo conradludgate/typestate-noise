@@ -8,11 +8,6 @@ pub struct S<T> {
     t: T,
 }
 
-/// Generates a new ephemeral keypair, appends the public key to the buffer and calls mixhash
-pub struct E<T> {
-    t: T,
-}
-
 impl S<()> {
     pub fn recv<K0, K1, K3, K4>(
         b: &mut BytesMut,
@@ -62,6 +57,69 @@ impl S<()> {
             .symm
             .encrypt_and_hash(pk.as_bytes(), b, &mut state.cipher);
         state
+    }
+}
+
+/// Generates a new ephemeral keypair, appends the public key to the buffer and calls mixhash
+pub struct E<T> {
+    t: T,
+}
+
+impl E<()> {
+    pub fn recv<K0, K1, K2, K4>(
+        b: &mut BytesMut,
+        mut state: HandshakeState<K0, K1, K2, Unknown, K4>,
+    ) -> Result<HandshakeState<K0, K1, K2, Known, K4>, chacha20poly1305::Error>
+    where
+        KeyPair: Val<K0>,
+        EphKeyPair: Val<K1>,
+        PubKey: Val<K2>,
+        Key: Val<K4>,
+        CipherState<K4>: CipherStateAlg,
+    {
+        // typecheck that re is unknown
+        let _: () = state.re;
+
+        if b.len() < 32 {
+            return Err(chacha20poly1305::Error);
+        }
+        let payload = b.split_to(32);
+        state.symm = state.symm.mix_hash(&payload);
+        let pk = PublicKey::from(<[u8; 32]>::try_from(&*payload).unwrap());
+
+        Ok(HandshakeState::<K0, K1, K2, Known, K4> {
+            cipher: state.cipher,
+            symm: state.symm,
+            s: state.s,
+            e: state.e,
+            rs: state.rs,
+            re: PubKey(pk),
+        })
+    }
+
+    pub fn send<K0, K2, K3, K4>(
+        b: &mut Vec<u8>,
+        mut state: HandshakeState<K0, Unknown, K2, K3, K4>,
+    ) -> HandshakeState<K0, Known, K2, K3, K4>
+    where
+        KeyPair: Val<K0>,
+        PubKey: Val<K2> + Val<K3>,
+        Key: Val<K4>,
+        CipherState<K4>: CipherStateAlg,
+    {
+        let ek = ReusableSecret::random();
+        let pk = PublicKey::from(&ek);
+        b.extend_from_slice(pk.as_bytes());
+        state.symm = state.symm.mix_hash(pk.as_bytes());
+
+        HandshakeState::<K0, Known, K2, K3, K4> {
+            cipher: state.cipher,
+            symm: state.symm,
+            s: state.s,
+            e: EphKeyPair(ek),
+            rs: state.rs,
+            re: state.re,
+        }
     }
 }
 
