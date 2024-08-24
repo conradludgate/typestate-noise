@@ -176,6 +176,59 @@ impl Ee<()> {
     }
 }
 
+/// Calls MixKey(DH(s, rs)).
+pub struct Ss<T> {
+    t: T,
+}
+
+impl Ss<()> {
+    pub fn recv<K1, K3, K4>(
+        b: &mut BytesMut,
+        state: HandshakeState<Known, K1, Known, K3, K4>,
+    ) -> Result<HandshakeState<Known, K1, Known, K3, Known>, chacha20poly1305::Error>
+    where
+        EphKeyPair: Val<K1>,
+        PubKey: Val<K3>,
+        Key: Val<K4>,
+        CipherState<K4>: CipherStateAlg,
+    {
+        let dh = state.s.0.diffie_hellman(&state.rs.0);
+        let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
+
+        Ok(HandshakeState::<Known, K1, Known, K3, Known> {
+            cipher,
+            symm,
+            s: state.s,
+            e: state.e,
+            rs: state.rs,
+            re: state.re,
+        })
+    }
+
+    pub fn send<K1, K3, K4>(
+        b: &mut Vec<u8>,
+        state: HandshakeState<Known, K1, Known, K3, K4>,
+    ) -> HandshakeState<Known, K1, Known, K3, Known>
+    where
+        EphKeyPair: Val<K1>,
+        PubKey: Val<K3>,
+        Key: Val<K4>,
+        CipherState<K4>: CipherStateAlg,
+    {
+        let dh = state.s.0.diffie_hellman(&state.rs.0);
+        let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
+
+        HandshakeState::<Known, K1, Known, K3, Known> {
+            cipher,
+            symm,
+            s: state.s,
+            e: state.e,
+            rs: state.rs,
+            re: state.re,
+        }
+    }
+}
+
 /// Calls MixKey(DH(e, rs)) if initiator, MixKey(DH(s, re)) if responder
 pub struct Es<T> {
     t: T,
