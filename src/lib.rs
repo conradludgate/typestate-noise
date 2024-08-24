@@ -1,6 +1,6 @@
 use bytes::BytesMut;
-use chacha20poly1305::{aead::AeadMutInPlace, ChaCha20Poly1305, KeyInit, Tag};
-use sha2::{digest::Digest, Sha256};
+use chacha20poly1305::{ChaCha20Poly1305, Tag};
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, ReusableSecret, StaticSecret};
 
 /// Appends "EncryptAndHash(s.public_key)" to the buffer.
@@ -122,6 +122,8 @@ pub trait CipherStateAlg {
 
 impl CipherStateAlg for CipherState<Known> {
     fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut Vec<u8>) {
+        use chacha20poly1305::{AeadInPlace, KeyInit};
+
         let l = ciphertext.len();
         ciphertext.extend_from_slice(plaintext);
 
@@ -140,6 +142,8 @@ impl CipherStateAlg for CipherState<Known> {
         ad: &[u8],
         ciphertext: &'a mut [u8],
     ) -> Result<&'a mut [u8], chacha20poly1305::Error> {
+        use chacha20poly1305::{AeadInPlace, KeyInit};
+
         let (plaintext, tag) = ciphertext
             .split_at_mut_checked(ciphertext.len() - 16)
             .ok_or(chacha20poly1305::Error)?;
@@ -197,12 +201,43 @@ fn nonce(counter: u64) -> chacha20poly1305::Nonce {
 }
 
 impl SymmetricState {
-    fn mix_hash(&mut self, data: &[u8]) {
-        self.h = Sha256::new()
+    fn mix_hash(&self, data: &[u8]) -> Self {
+        use sha2::Digest;
+        let h = Sha256::new()
             .chain_update(self.h)
             .chain_update(data)
             .finalize()
             .into();
+        Self { ck: self.ck, h }
+    }
+
+    fn mix_hash_and_key(&self, data: &[u8]) -> (Self, CipherState<Known>) {
+        let [ck, temp_h, temp_k] = hkdf(&self.ck, data);
+        let mut this = self.mix_hash(&temp_h);
+        this.ck = ck;
+        (
+            this,
+            CipherState {
+                k: Key(temp_k.into()),
+                n: 0,
+            },
+        )
+    }
+
+    fn mix_key(&self, data: &[u8]) -> (Self, CipherState<Known>) {
+        let [ck, temp_k] = hkdf(&self.ck, data);
+        (
+            Self { ck, h: self.h },
+            CipherState {
+                k: Key(temp_k.into()),
+                n: 0,
+            },
+        )
+    }
+
+    fn mix_chain_key(&self, data: &[u8]) -> Self {
+        let [ck] = hkdf(&self.ck, data);
+        Self { ck, h: self.h }
     }
 
     fn encrypt_and_hash<K>(
@@ -216,7 +251,7 @@ impl SymmetricState {
     {
         let l = ciphertext.len();
         c.encrypt_with_ad(&self.h, plaintext, ciphertext);
-        self.mix_hash(&ciphertext[l..]);
+        *self = self.mix_hash(&ciphertext[l..]);
     }
 
     fn decrypt_and_hash<'a, K>(
@@ -228,18 +263,43 @@ impl SymmetricState {
         Key: Val<K>,
         CipherState<K>: CipherStateAlg,
     {
-        let new_h = Sha256::new()
-            .chain_update(self.h)
-            .chain_update(&*ciphertext)
-            .finalize()
-            .into();
-
+        let new = self.mix_hash(ciphertext);
         let p = c.decrypt_with_ad(&self.h, ciphertext)?;
-
-        self.h = new_h;
+        *self = new;
 
         Ok(p)
     }
+}
+
+fn hkdf<const N: usize>(key: &[u8; 32], msg: &[u8]) -> [[u8; 32]; N] {
+    use hmac::Mac;
+    type Hmac = hmac::Hmac<Sha256>;
+
+    assert!(N > 0);
+    assert!(N <= 255);
+
+    let mut output = [[0u8; 32]; N];
+
+    let tk = Hmac::new_from_slice(key)
+        .unwrap()
+        .chain_update(msg)
+        .finalize()
+        .into_bytes();
+    let hmac = Hmac::new_from_slice(&tk).unwrap();
+    let mut ti = hmac.clone().chain_update([1u8]).finalize().into_bytes();
+    output[0] = ti.into();
+
+    for i in 1..N as u8 {
+        ti = hmac
+            .clone()
+            .chain_update(ti)
+            .chain_update([i + 1])
+            .finalize()
+            .into_bytes();
+        output[i as usize] = ti.into();
+    }
+
+    output
 }
 
 pub struct CipherState<K>
