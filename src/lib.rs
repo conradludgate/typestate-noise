@@ -17,55 +17,30 @@ macro_rules! hlist {
     };
 }
 
-impl<K0, K1, K2, K3, K4, S, T, U> Send<K0, K1, K2, K3, K4, S> for HList<T, U>
+impl<T, U, St: States + ?Sized> Send<St> for HList<T, U>
 where
-    K0: Val,
-    K1: Val,
-    K2: Val,
-    K3: Val,
-    K4: Val,
-    S: Sender,
-
-    T: Send<K0, K1, K2, K3, K4, S>,
-    U: Send<T::K0, T::K1, T::K2, T::K3, T::K4, S>,
+    T: Send<St>,
+    U: Send<T::St>,
 {
-    type K0 = U::K0;
-    type K1 = U::K1;
-    type K2 = U::K2;
-    type K3 = U::K3;
-    type K4 = U::K4;
+    type St = U::St;
 
-    fn send(
-        b: &mut Vec<u8>,
-        state: HandshakeState<K0, K1, K2, K3, K4, S>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
+    fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<U::St> {
         let state = T::send(b, state);
         U::send(b, state)
     }
 }
 
-impl<K0, K1, K2, K3, K4, S, T, U> Recv<K0, K1, K2, K3, K4, S> for HList<T, U>
+impl<T, U, St: States + ?Sized> Recv<St> for HList<T, U>
 where
-    K0: Val,
-    K1: Val,
-    K2: Val,
-    K3: Val,
-    K4: Val,
-    S: Sender,
-
-    T: Recv<K0, K1, K2, K3, K4, S>,
-    U: Recv<T::K0, T::K1, T::K2, T::K3, T::K4, S>,
+    T: Recv<St>,
+    U: Recv<T::St>,
 {
-    type K0 = U::K0;
-    type K1 = U::K1;
-    type K2 = U::K2;
-    type K3 = U::K3;
-    type K4 = U::K4;
+    type St = U::St;
 
     fn recv(
         b: &mut BytesMut,
-        state: HandshakeState<K0, K1, K2, K3, K4, S>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let state = T::recv(b, state)?;
         U::recv(b, state)
     }
@@ -74,21 +49,16 @@ where
 /// Appends "EncryptAndHash(s.public_key)" to the buffer.
 pub struct S;
 
-impl<K0: Val, K1: Val, K3: Val, K4: Val, S_> Recv<K0, K1, Unknown, K3, K4, S_> for S
+impl<St: States<RemoteStaticKey = Unknown> + ?Sized> Recv<St> for S
 where
-    CipherState<K4>: CipherStateAlg,
-    S_: Sender,
+    CipherState<St::EncryptionKey>: CipherStateAlg,
 {
-    type K0 = K0;
-    type K1 = K1;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = K4;
+    type St = <St as StatesExt>::WithRemoteStaticKey;
 
     fn recv(
         b: &mut BytesMut,
-        mut state: HandshakeState<K0, K1, Unknown, K3, K4, S_>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S_>, Error> {
+        mut state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         // typecheck that rs is unknown
         let _: Unknown = state.rs;
 
@@ -101,37 +71,26 @@ where
             .decrypt_and_hash(&mut payload, &mut state.cipher)?;
         let pk = PublicKey::from(<[u8; 32]>::try_from(pk).unwrap());
 
-        Ok(HandshakeState::<K0, K1, Known, K3, K4, S_> {
+        Ok(HandshakeState::<Self::St> {
             cipher: state.cipher,
             symm: state.symm,
             s: state.s,
             e: state.e,
             rs: PubKey(pk),
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K1: Val, K2: Val, K3: Val, K4: Val, S_> Send<Known, K1, K2, K3, K4, S_> for S
+impl<St: States<StaticKey = Known> + ?Sized> Send<St> for S
 where
-    CipherState<K4>: CipherStateAlg,
-    S_: Sender,
+    CipherState<St::EncryptionKey>: CipherStateAlg,
 {
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = K2;
-    type K3 = K3;
-    type K4 = K4;
+    type St = St;
 
-    fn send(
-        b: &mut Vec<u8>,
-        mut state: HandshakeState<Known, K1, K2, K3, K4, S_>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S_> {
-        let pk = PublicKey::from(&state.s.0);
-        state
-            .symm
-            .encrypt_and_hash(pk.as_bytes(), b, &mut state.cipher);
+    fn send(b: &mut Vec<u8>, mut state: HandshakeState<St>) -> HandshakeState<St> {
+        let pk = PublicKey::from(&state.s.0).to_bytes();
+        state.symm.encrypt_and_hash(&pk, b, &mut state.cipher);
         state
     }
 }
@@ -139,20 +98,16 @@ where
 /// Generates a new ephemeral keypair, appends the public key to the buffer and calls mixhash
 pub struct E;
 
-impl<K0: Val, K1: Val, K2: Val, K4: Val, S> Recv<K0, K1, K2, Unknown, K4, S> for E
+impl<St: States<RemoteEphemeralKey = Unknown> + ?Sized> Recv<St> for E
 where
-    S: Sender,
+    CipherState<St::EncryptionKey>: CipherStateAlg,
 {
-    type K0 = K0;
-    type K1 = K1;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = K4;
+    type St = <St as StatesExt>::WithRemoteEphemeralKey;
 
     fn recv(
         b: &mut BytesMut,
-        state: HandshakeState<K0, K1, K2, Unknown, K4, S>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         // typecheck that re is unknown
         let _: Unknown = state.re;
 
@@ -163,45 +118,33 @@ where
         let symm = state.symm.mix_hash(&payload);
         let pk = PublicKey::from(<[u8; 32]>::try_from(&*payload).unwrap());
 
-        Ok(HandshakeState::<K0, K1, K2, Known, K4, S> {
+        Ok(HandshakeState::<Self::St> {
             cipher: state.cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: PubKey(pk),
-            sender: state.sender,
         })
     }
 }
 
-impl<K0: Val, K2: Val, K3: Val, K4: Val, S> Send<K0, Unknown, K2, K3, K4, S> for E
-where
-    S: Sender,
-{
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = K2;
-    type K3 = K3;
-    type K4 = K4;
+impl<St: States<EphemeralKey = Unknown> + ?Sized> Send<St> for E {
+    type St = <St as StatesExt>::WithEphemeralKey;
 
-    fn send(
-        b: &mut Vec<u8>,
-        state: HandshakeState<K0, Unknown, K2, K3, K4, S>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
+    fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let ek = ReusableSecret::random();
         let pk = PublicKey::from(&ek);
         b.extend_from_slice(pk.as_bytes());
         let symm = state.symm.mix_hash(pk.as_bytes());
 
-        HandshakeState::<K0, Known, K2, K3, K4, S> {
+        HandshakeState::<Self::St> {
             cipher: state.cipher,
             symm,
             s: state.s,
             e: EphKeyPair(ek),
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
@@ -209,60 +152,41 @@ where
 /// Generates a new ephemeral keypair, appends the public key to the buffer and calls mixhash
 pub struct Ee;
 
-impl<K0: Val, K2: Val, K4: Val, S> Recv<K0, Known, K2, Known, K4, S> for Ee
-where
-    S: Sender,
-{
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = Known;
+impl<St: States<EphemeralKey = Known, RemoteEphemeralKey = Known> + ?Sized> Recv<St> for Ee {
+    type St = <St as StatesExt>::WithEncryptionKey;
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<K0, Known, K2, Known, K4, S>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let dh = state.e.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<K0, Known, K2, Known, Known, S> {
+        Ok(HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K0: Val, K2: Val, K4: Val, S> Send<K0, Known, K2, Known, K4, S> for Ee
-where
-    S: Sender,
-{
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = Known;
+impl<St: States<EphemeralKey = Known, RemoteEphemeralKey = Known> + ?Sized> Send<St> for Ee {
+    type St = <St as StatesExt>::WithEncryptionKey;
 
-    fn send(
-        _b: &mut Vec<u8>,
-        state: HandshakeState<K0, Known, K2, Known, K4, S>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
+    fn send(_b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let dh = state.e.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<K0, Known, K2, Known, Known, S> {
+        HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
@@ -270,60 +194,41 @@ where
 /// Calls MixKey(DH(s, rs)).
 pub struct Ss;
 
-impl<K1: Val, K3: Val, K4: Val, S> Recv<Known, K1, Known, K3, K4, S> for Ss
-where
-    S: Sender,
-{
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = Known;
+impl<St: States<StaticKey = Known, RemoteStaticKey = Known> + ?Sized> Recv<St> for Ss {
+    type St = <St as StatesExt>::WithEncryptionKey;
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<Known, K1, Known, K3, K4, S>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let dh = state.s.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<Known, K1, Known, K3, Known, S> {
+        Ok(HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K1: Val, K3: Val, K4: Val, S> Send<Known, K1, Known, K3, K4, S> for Ss
-where
-    S: Sender,
-{
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = Known;
+impl<St: States<StaticKey = Known, RemoteStaticKey = Known> + ?Sized> Send<St> for Ss {
+    type St = <St as StatesExt>::WithEncryptionKey;
 
-    fn send(
-        _b: &mut Vec<u8>,
-        state: HandshakeState<Known, K1, Known, K3, K4, S>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
+    fn send(_b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let dh = state.s.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<Known, K1, Known, K3, Known, S> {
+        HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
@@ -331,108 +236,96 @@ where
 /// Calls MixKey(DH(e, rs)) if initiator, MixKey(DH(s, re)) if responder
 pub struct Es;
 
-impl<K0: Val, K3: Val, K4: Val> Recv<K0, Known, Known, K3, K4, Initiator> for Es {
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = Known;
+impl<St: States<EphemeralKey = Known, RemoteStaticKey = Known, Side = Initiator> + ?Sized> Recv<St>
+    for Es
+{
+    type St = <St as StatesExt>::WithEncryptionKey;
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<K0, Known, Known, K3, K4, Initiator>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator>, Error>
-    {
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<K0, Known, Known, K3, Known, Initiator> {
+        Ok(HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K0: Val, K3: Val, K4: Val> Send<K0, Known, Known, K3, K4, Initiator> for Es {
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = Known;
+impl<St: States<EphemeralKey = Known, RemoteStaticKey = Known, Side = Initiator> + ?Sized> Send<St>
+    for Es
+{
+    type St = <St as StatesExt>::WithEncryptionKey;
 
-    fn send(
-        _b: &mut Vec<u8>,
-        state: HandshakeState<K0, Known, Known, K3, K4, Initiator>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator> {
+    fn send(_b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<K0, Known, Known, K3, Known, Initiator> {
+        HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
 
-impl<K1: Val, K2: Val, K4: Val> Recv<Known, K1, K2, Known, K4, Responder> for Es {
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = Known;
+type EsResp<K1, K2, K4> = dyn States<
+    StaticKey = Known,
+    EphemeralKey = K1,
+    RemoteStaticKey = K2,
+    RemoteEphemeralKey = Known,
+    EncryptionKey = K4,
+    Side = Responder,
+>;
+
+impl<K1: Val, K2: Val, K4: Val> Recv<EsResp<K1, K2, K4>> for Es {
+    type St = <EsResp<K1, K2, K4> as StatesExt>::WithEncryptionKey;
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<Known, K1, K2, Known, K4, Responder>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder>, Error>
-    {
+        state: HandshakeState<EsResp<K1, K2, K4>>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<Known, K1, K2, Known, Known, Responder> {
+        Ok(HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K1: Val, K2: Val, K4: Val> Send<Known, K1, K2, Known, K4, Responder> for Es {
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = Known;
+impl<K1: Val, K2: Val, K4: Val> Send<EsResp<K1, K2, K4>> for Es {
+    type St = <EsResp<K1, K2, K4> as StatesExt>::WithEncryptionKey;
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<Known, K1, K2, Known, K4, Responder>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder> {
+        state: HandshakeState<EsResp<K1, K2, K4>>,
+    ) -> HandshakeState<Self::St> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<Known, K1, K2, Known, Known, Responder> {
+        HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
@@ -440,144 +333,181 @@ impl<K1: Val, K2: Val, K4: Val> Send<Known, K1, K2, Known, K4, Responder> for Es
 /// Calls MixKey(DH(s, re)) if initiator, MixKey(DH(e, rs)) if responder.
 pub struct Se;
 
-impl<K0: Val, K3: Val, K4: Val> Recv<K0, Known, Known, K3, K4, Responder> for Se {
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = Known;
+type SeResp<K0, K3, K4> = dyn States<
+    StaticKey = K0,
+    EphemeralKey = Known,
+    RemoteStaticKey = Known,
+    RemoteEphemeralKey = K3,
+    EncryptionKey = K4,
+    Side = Responder,
+>;
+
+impl<K0: Val, K3: Val, K4: Val> Recv<SeResp<K0, K3, K4>> for Se {
+    type St = <SeResp<K0, K3, K4> as StatesExt>::WithEncryptionKey;
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<K0, Known, Known, K3, K4, Responder>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder>, Error>
-    {
+        state: HandshakeState<SeResp<K0, K3, K4>>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<K0, Known, Known, K3, Known, Responder> {
+        Ok(HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K0: Val, K3: Val, K4: Val> Send<K0, Known, Known, K3, K4, Responder> for Se {
-    type K0 = K0;
-    type K1 = Known;
-    type K2 = Known;
-    type K3 = K3;
-    type K4 = Known;
+impl<K0: Val, K3: Val, K4: Val> Send<SeResp<K0, K3, K4>> for Se {
+    type St = <SeResp<K0, K3, K4> as StatesExt>::WithEncryptionKey;
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<K0, Known, Known, K3, K4, Responder>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder> {
+        state: HandshakeState<SeResp<K0, K3, K4>>,
+    ) -> HandshakeState<Self::St> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<K0, Known, Known, K3, Known, Responder> {
+        HandshakeState::<Self::St> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
 
-impl<K1: Val, K2: Val, K4: Val> Recv<Known, K1, K2, Known, K4, Initiator> for Se {
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = Known;
+type EsInit<K1, K2, K4> = dyn States<
+    StaticKey = Known,
+    EphemeralKey = K1,
+    RemoteStaticKey = K2,
+    RemoteEphemeralKey = Known,
+    EncryptionKey = K4,
+    Side = Initiator,
+>;
+
+impl<K1: Val, K2: Val, K4: Val> Recv<EsInit<K1, K2, K4>> for Se {
+    type St = <EsInit<K1, K2, K4> as StatesExt>::WithEncryptionKey;
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<Known, K1, K2, Known, K4, Initiator>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator>, Error>
-    {
+        state: HandshakeState<EsInit<K1, K2, K4>>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<Known, K1, K2, Known, Known, Initiator> {
+        Ok(HandshakeState {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         })
     }
 }
 
-impl<K1: Val, K2: Val, K4: Val> Send<Known, K1, K2, Known, K4, Initiator> for Se {
-    type K0 = Known;
-    type K1 = K1;
-    type K2 = K2;
-    type K3 = Known;
-    type K4 = Known;
+impl<K1: Val, K2: Val, K4: Val> Send<EsInit<K1, K2, K4>> for Se {
+    type St = <EsInit<K1, K2, K4> as StatesExt>::WithEncryptionKey;
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<Known, K1, K2, Known, K4, Initiator>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator> {
+        state: HandshakeState<EsInit<K1, K2, K4>>,
+    ) -> HandshakeState<Self::St> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<Known, K1, K2, Known, Known, Initiator> {
+        HandshakeState {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
-            sender: state.sender,
         }
     }
 }
 
-pub trait Send<K0: Val, K1: Val, K2: Val, K3: Val, K4: Val, S>
-where
-    S: Sender,
-{
-    type K0: Val;
-    type K1: Val;
-    type K2: Val;
-    type K3: Val;
-    type K4: Val;
+pub trait States {
+    type StaticKey: Val;
+    type EphemeralKey: Val;
+    type RemoteStaticKey: Val;
+    type RemoteEphemeralKey: Val;
+    type EncryptionKey: Val;
+    type Side: Sender;
+}
 
-    fn send(
-        b: &mut Vec<u8>,
-        state: HandshakeState<K0, K1, K2, K3, K4, S>,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>;
+pub trait StatesExt {
+    type WithStaticKey: States + ?Sized;
+    type WithEphemeralKey: States + ?Sized;
+    type WithRemoteStaticKey: States + ?Sized;
+    type WithRemoteEphemeralKey: States + ?Sized;
+    type WithEncryptionKey: States + ?Sized;
+}
+
+impl<St: States + ?Sized> StatesExt for St {
+    type WithStaticKey = dyn States<
+        StaticKey = Known,
+        EphemeralKey = St::EphemeralKey,
+        RemoteStaticKey = St::RemoteStaticKey,
+        RemoteEphemeralKey = St::RemoteEphemeralKey,
+        EncryptionKey = St::EncryptionKey,
+        Side = St::Side,
+    >;
+    type WithEphemeralKey = dyn States<
+        StaticKey = St::StaticKey,
+        EphemeralKey = Known,
+        RemoteStaticKey = St::RemoteStaticKey,
+        RemoteEphemeralKey = St::RemoteEphemeralKey,
+        EncryptionKey = St::EncryptionKey,
+        Side = St::Side,
+    >;
+    type WithRemoteStaticKey = dyn States<
+        StaticKey = St::StaticKey,
+        EphemeralKey = St::EphemeralKey,
+        RemoteStaticKey = Known,
+        RemoteEphemeralKey = St::RemoteEphemeralKey,
+        EncryptionKey = St::EncryptionKey,
+        Side = St::Side,
+    >;
+    type WithRemoteEphemeralKey = dyn States<
+        StaticKey = St::StaticKey,
+        EphemeralKey = St::EphemeralKey,
+        RemoteStaticKey = St::RemoteStaticKey,
+        RemoteEphemeralKey = Known,
+        EncryptionKey = St::EncryptionKey,
+        Side = St::Side,
+    >;
+    type WithEncryptionKey = dyn States<
+        StaticKey = St::StaticKey,
+        EphemeralKey = St::EphemeralKey,
+        RemoteStaticKey = St::RemoteStaticKey,
+        RemoteEphemeralKey = St::RemoteEphemeralKey,
+        EncryptionKey = Known,
+        Side = St::Side,
+    >;
+}
+
+pub trait Send<St: States + ?Sized> {
+    type St: States + ?Sized;
+
+    fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St>;
 }
 
 pub type Error = chacha20poly1305::Error;
 
-pub trait Recv<K0: Val, K1: Val, K2: Val, K3: Val, K4: Val, S>
-where
-    S: Sender,
-{
-    type K0: Val;
-    type K1: Val;
-    type K2: Val;
-    type K3: Val;
-    type K4: Val;
+pub trait Recv<St: States + ?Sized> {
+    type St: States + ?Sized;
 
-    fn recv(
-        b: &mut BytesMut,
-        state: HandshakeState<K0, K1, K2, K3, K4, S>,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error>;
+    fn recv(b: &mut BytesMut, state: HandshakeState<St>)
+        -> Result<HandshakeState<Self::St>, Error>;
 }
 
 pub trait Sender {}
@@ -836,20 +766,82 @@ impl SymmetricState {
     }
 }
 
-pub struct HandshakeState<K0: Val, K1: Val, K2: Val, K3: Val, K4: Val, S: Sender> {
-    cipher: CipherState<K4>,
+pub struct HandshakeState<St: States + ?Sized> {
+    cipher: CipherState<St::EncryptionKey>,
     symm: SymmetricState,
 
     /// local static key pair
-    s: K0::Val<KeyPair>,
+    s: <St::StaticKey as Val>::Val<KeyPair>,
     /// local ephemeral key pair
-    e: K1::Val<EphKeyPair>,
+    e: <St::EphemeralKey as Val>::Val<EphKeyPair>,
     /// remote static public key
-    rs: K2::Val<PubKey>,
+    rs: <St::RemoteStaticKey as Val>::Val<PubKey>,
     /// remote ephemeral public key
-    re: K3::Val<PubKey>,
+    re: <St::RemoteEphemeralKey as Val>::Val<PubKey>,
+}
 
-    sender: S,
+impl
+    HandshakeState<
+        dyn States<
+            StaticKey = Unknown,
+            EphemeralKey = Unknown,
+            RemoteStaticKey = Unknown,
+            RemoteEphemeralKey = Unknown,
+            EncryptionKey = Unknown,
+            Side = Initiator,
+        >,
+    >
+{
+    pub fn initiator(pattern: &str) -> Self {
+        Self {
+            cipher: CipherState::default(),
+            symm: SymmetricState::new(pattern),
+            s: Unknown,
+            e: Unknown,
+            rs: Unknown,
+            re: Unknown,
+        }
+    }
+}
+
+impl
+    HandshakeState<
+        dyn States<
+            StaticKey = Unknown,
+            EphemeralKey = Unknown,
+            RemoteStaticKey = Unknown,
+            RemoteEphemeralKey = Unknown,
+            EncryptionKey = Unknown,
+            Side = Responder,
+        >,
+    >
+{
+    pub fn responder(pattern: &str) -> Self {
+        Self {
+            cipher: CipherState::default(),
+            symm: SymmetricState::new(pattern),
+            s: Unknown,
+            e: Unknown,
+            rs: Unknown,
+            re: Unknown,
+        }
+    }
+}
+
+impl<St: States<StaticKey = Unknown> + ?Sized> HandshakeState<St> {
+    pub fn with_static_key(
+        self,
+        key: StaticSecret,
+    ) -> HandshakeState<<St as StatesExt>::WithStaticKey> {
+        HandshakeState {
+            cipher: self.cipher,
+            symm: self.symm,
+            s: KeyPair(key),
+            e: self.e,
+            rs: self.rs,
+            re: self.re,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -862,25 +854,10 @@ mod tests {
         type IkMsg0 = hlist![E, Es, S, Ss];
         type IkMsg1 = hlist![E, Ee, Se];
 
-        let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Initiator> {
-            cipher: CipherState::default(),
-            symm: SymmetricState::new("Noise_IK_25519_ChaChaPoly_SHA256"),
-            s: KeyPair(StaticSecret::random()),
-            e: Unknown,
-            rs: Unknown,
-            re: Unknown,
-            sender: Initiator,
-        };
-
-        let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Responder> {
-            cipher: CipherState::default(),
-            symm: SymmetricState::new("Noise_IK_25519_ChaChaPoly_SHA256"),
-            s: KeyPair(StaticSecret::random()),
-            e: Unknown,
-            rs: Unknown,
-            re: Unknown,
-            sender: Responder,
-        };
+        let hs_init = HandshakeState::initiator("Noise_IK_25519_ChaChaPoly_SHA256")
+            .with_static_key(StaticSecret::random());
+        let hs_resp = HandshakeState::responder("Noise_IK_25519_ChaChaPoly_SHA256")
+            .with_static_key(StaticSecret::random());
 
         let mut msg = vec![];
         let hs_resp = IkPre0::send(&mut msg, hs_resp);
@@ -905,25 +882,10 @@ mod tests {
         type KxMsg0 = hlist![E];
         type KxMsg1 = hlist![E, Ee, Se, S, Es];
 
-        let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Initiator> {
-            cipher: CipherState::default(),
-            symm: SymmetricState::new("Noise_KX_25519_ChaChaPoly_SHA256"),
-            s: KeyPair(StaticSecret::random()),
-            e: Unknown,
-            rs: Unknown,
-            re: Unknown,
-            sender: Initiator,
-        };
-
-        let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Responder> {
-            cipher: CipherState::default(),
-            symm: SymmetricState::new("Noise_KX_25519_ChaChaPoly_SHA256"),
-            s: KeyPair(StaticSecret::random()),
-            e: Unknown,
-            rs: Unknown,
-            re: Unknown,
-            sender: Responder,
-        };
+        let hs_init = HandshakeState::initiator("Noise_KX_25519_ChaChaPoly_SHA256")
+            .with_static_key(StaticSecret::random());
+        let hs_resp = HandshakeState::responder("Noise_KX_25519_ChaChaPoly_SHA256")
+            .with_static_key(StaticSecret::random());
 
         let mut msg = vec![];
         let hs_init = KxPre0::send(&mut msg, hs_init);
