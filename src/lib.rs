@@ -809,11 +809,31 @@ where
     n: u64,
 }
 
+impl Default for CipherState<Unknown> {
+    fn default() -> Self {
+        Self { k: Unknown, n: 0 }
+    }
+}
+
 pub struct SymmetricState {
     /// chaining key
     ck: [u8; 32],
     /// hash
     h: [u8; 32],
+}
+
+impl SymmetricState {
+    pub fn new(protocol: &str) -> Self {
+        let h = if protocol.len() < 32 {
+            let mut h = [0; 32];
+            h[..protocol.len()].copy_from_slice(protocol.as_bytes());
+            h
+        } else {
+            use sha2::Digest;
+            Sha256::digest(protocol).into()
+        };
+        Self { ck: h, h }
+    }
 }
 
 pub struct HandshakeState<K0: Val, K1: Val, K2: Val, K3: Val, K4: Val, S: Sender> {
@@ -835,18 +855,16 @@ pub struct HandshakeState<K0: Val, K1: Val, K2: Val, K3: Val, K4: Val, S: Sender
 #[cfg(test)]
 mod tests {
     use super::*;
-    type IkPre0 = hlist![S];
-    type IkMsg0 = hlist![E, Es, S, Ss];
-    type IkMsg1 = hlist![E, Ee, Se];
 
     #[test]
-    fn check_ik_full() {
+    fn check_ik() {
+        type IkPre0 = hlist![S];
+        type IkMsg0 = hlist![E, Es, S, Ss];
+        type IkMsg1 = hlist![E, Ee, Se];
+
         let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Initiator> {
-            cipher: CipherState { k: Unknown, n: 0 },
-            symm: SymmetricState {
-                h: [0; 32],
-                ck: [0; 32],
-            },
+            cipher: CipherState::default(),
+            symm: SymmetricState::new("Noise_IK_25519_ChaChaPoly_SHA256"),
             s: KeyPair(StaticSecret::random()),
             e: Unknown,
             rs: Unknown,
@@ -855,11 +873,8 @@ mod tests {
         };
 
         let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Responder> {
-            cipher: CipherState { k: Unknown, n: 0 },
-            symm: SymmetricState {
-                h: [0; 32],
-                ck: [0; 32],
-            },
+            cipher: CipherState::default(),
+            symm: SymmetricState::new("Noise_IK_25519_ChaChaPoly_SHA256"),
             s: KeyPair(StaticSecret::random()),
             e: Unknown,
             rs: Unknown,
@@ -878,6 +893,49 @@ mod tests {
         let mut msg = vec![];
         let hs_resp = IkMsg1::send(&mut msg, hs_resp);
         let hs_init = IkMsg1::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
+
+        assert_eq!(hs_init.cipher.k.0, hs_resp.cipher.k.0);
+        assert_eq!(hs_init.symm.ck, hs_resp.symm.ck);
+        assert_eq!(hs_init.symm.h, hs_resp.symm.h);
+    }
+
+    #[test]
+    fn check_kx() {
+        type KxPre0 = hlist![S];
+        type KxMsg0 = hlist![E];
+        type KxMsg1 = hlist![E, Ee, Se, S, Es];
+
+        let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Initiator> {
+            cipher: CipherState::default(),
+            symm: SymmetricState::new("Noise_KX_25519_ChaChaPoly_SHA256"),
+            s: KeyPair(StaticSecret::random()),
+            e: Unknown,
+            rs: Unknown,
+            re: Unknown,
+            sender: Initiator,
+        };
+
+        let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Responder> {
+            cipher: CipherState::default(),
+            symm: SymmetricState::new("Noise_KX_25519_ChaChaPoly_SHA256"),
+            s: KeyPair(StaticSecret::random()),
+            e: Unknown,
+            rs: Unknown,
+            re: Unknown,
+            sender: Responder,
+        };
+
+        let mut msg = vec![];
+        let hs_init = KxPre0::send(&mut msg, hs_init);
+        let hs_resp = KxPre0::recv(&mut BytesMut::from(&*msg), hs_resp).unwrap();
+
+        let mut msg = vec![];
+        let hs_init = KxMsg0::send(&mut msg, hs_init);
+        let hs_resp = KxMsg0::recv(&mut BytesMut::from(&*msg), hs_resp).unwrap();
+
+        let mut msg = vec![];
+        let hs_resp = KxMsg1::send(&mut msg, hs_resp);
+        let hs_init = KxMsg1::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
 
         assert_eq!(hs_init.cipher.k.0, hs_resp.cipher.k.0);
         assert_eq!(hs_init.symm.ck, hs_resp.symm.ck);
