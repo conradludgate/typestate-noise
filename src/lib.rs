@@ -911,4 +911,47 @@ mod tests {
             Responder,
         );
     }
+
+    #[test]
+    fn check_ik_full() {
+        let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown> {
+            cipher: CipherState { k: Unknown, n: 0 },
+            symm: SymmetricState {
+                h: [0; 32],
+                ck: [0; 32],
+            },
+            s: KeyPair(StaticSecret::random()),
+            e: Unknown,
+            rs: Unknown,
+            re: Unknown,
+        };
+
+        let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown> {
+            cipher: CipherState { k: Unknown, n: 0 },
+            symm: SymmetricState {
+                h: [0; 32],
+                ck: [0; 32],
+            },
+            s: KeyPair(StaticSecret::random()),
+            e: Unknown,
+            rs: Unknown,
+            re: Unknown,
+        };
+
+        let mut msg = vec![];
+        let hs_resp = IkPre0::send(&mut msg, hs_resp, Responder);
+        let hs_init = IkPre0::recv(&mut BytesMut::from(&*msg), hs_init, Initiator).unwrap();
+
+        let mut msg = vec![];
+        let hs_init = IkMsg0::send(&mut msg, hs_init, Initiator);
+        let hs_resp = IkMsg0::recv(&mut BytesMut::from(&*msg), hs_resp, Responder).unwrap();
+
+        let mut msg = vec![];
+        let hs_resp = IkMsg1::send(&mut msg, hs_resp, Responder);
+        let hs_init = IkMsg1::recv(&mut BytesMut::from(&*msg), hs_init, Initiator).unwrap();
+
+        assert_eq!(hs_init.cipher.k.0, hs_resp.cipher.k.0);
+        assert_eq!(hs_init.symm.ck, hs_resp.symm.ck);
+        assert_eq!(hs_init.symm.h, hs_resp.symm.h);
+    }
 }
