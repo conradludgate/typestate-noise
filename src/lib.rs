@@ -19,24 +19,16 @@ macro_rules! hlist {
 
 impl<K0, K1, K2, K3, K4, S, T, U> Send<K0, K1, K2, K3, K4, S> for HList<T, U>
 where
-    KeyPair: Val<K0>,
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K2> + Val<K3>,
+    K0: Val2,
+    K1: Val2,
+    K2: Val2,
+    K3: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
     S: Sender,
 
     T: Send<K0, K1, K2, K3, K4, S>,
-    KeyPair: Val<T::NextK0>,
-    EphKeyPair: Val<T::NextK1>,
-    PubKey: Val<T::NextK2>,
-    PubKey: Val<T::NextK3>,
-
     U: Send<T::NextK0, T::NextK1, T::NextK2, T::NextK3, T::NextK4, S>,
-    KeyPair: Val<U::NextK0>,
-    EphKeyPair: Val<U::NextK1>,
-    PubKey: Val<U::NextK2>,
-    PubKey: Val<U::NextK3>,
 {
     type NextK0 = U::NextK0;
     type NextK1 = U::NextK1;
@@ -63,14 +55,14 @@ impl S {
         mut state: HandshakeState<K0, K1, Unknown, K3, K4>,
     ) -> Result<HandshakeState<K0, K1, Known, K3, K4>, chacha20poly1305::Error>
     where
-        KeyPair: Val<K0>,
-        EphKeyPair: Val<K1>,
-        PubKey: Val<K3>,
+        K0: Val2,
+        K1: Val2,
+        K3: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
         // typecheck that rs is unknown
-        let _: () = state.rs;
+        let _: Unknown = state.rs;
 
         if b.len() < 32 + state.cipher.tag_len() {
             return Err(chacha20poly1305::Error);
@@ -94,8 +86,9 @@ impl S {
 
 impl<K1, K2, K3, K4, S_> Send<Known, K1, K2, K3, K4, S_> for S
 where
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K2> + Val<K3>,
+    K1: Val2,
+    K2: Val2,
+    K3: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
     S_: Sender,
@@ -128,14 +121,14 @@ impl E {
         mut state: HandshakeState<K0, K1, K2, Unknown, K4>,
     ) -> Result<HandshakeState<K0, K1, K2, Known, K4>, chacha20poly1305::Error>
     where
-        KeyPair: Val<K0>,
-        EphKeyPair: Val<K1>,
-        PubKey: Val<K2>,
+        K0: Val2,
+        K1: Val2,
+        K2: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
         // typecheck that re is unknown
-        let _: () = state.re;
+        let _: Unknown = state.re;
 
         if b.len() < 32 {
             return Err(chacha20poly1305::Error);
@@ -157,8 +150,9 @@ impl E {
 
 impl<K0, K2, K3, K4, S> Send<K0, Unknown, K2, K3, K4, S> for E
 where
-    KeyPair: Val<K0>,
-    PubKey: Val<K2> + Val<K3>,
+    K0: Val2,
+    K2: Val2,
+    K3: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
     S: Sender,
@@ -199,8 +193,8 @@ impl Ee {
         state: HandshakeState<K0, Known, K2, Known, K4>,
     ) -> Result<HandshakeState<K0, Known, K2, Known, Known>, chacha20poly1305::Error>
     where
-        KeyPair: Val<K0>,
-        PubKey: Val<K2>,
+        K0: Val2,
+        K2: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
@@ -220,8 +214,8 @@ impl Ee {
 
 impl<K0, K2, K4, S> Send<K0, Known, K2, Known, K4, S> for Ee
 where
-    KeyPair: Val<K0>,
-    PubKey: Val<K2>,
+    K0: Val2,
+    K2: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
     S: Sender,
@@ -260,8 +254,8 @@ impl Ss {
         state: HandshakeState<Known, K1, Known, K3, K4>,
     ) -> Result<HandshakeState<Known, K1, Known, K3, Known>, chacha20poly1305::Error>
     where
-        EphKeyPair: Val<K1>,
-        PubKey: Val<K3>,
+        K1: Val2,
+        K3: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
@@ -281,8 +275,8 @@ impl Ss {
 
 impl<K1, K3, K4, S> Send<Known, K1, Known, K3, K4, S> for Ss
 where
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K3>,
+    K1: Val2,
+    K3: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
     S: Sender,
@@ -321,8 +315,8 @@ impl Es {
         state: HandshakeState<K0, Known, Known, K3, K4>,
     ) -> Result<HandshakeState<K0, Known, Known, K3, Known>, chacha20poly1305::Error>
     where
-        KeyPair: Val<K0>,
-        PubKey: Val<K3>,
+        K0: Val2,
+        K3: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
@@ -342,8 +336,8 @@ impl Es {
 
 impl<K0, K3, K4> Send<K0, Known, Known, K3, K4, Initiator> for Es
 where
-    KeyPair: Val<K0>,
-    PubKey: Val<K3>,
+    K0: Val2,
+    K3: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
 {
@@ -378,8 +372,8 @@ impl Es {
         state: HandshakeState<Known, K1, K2, Known, K4>,
     ) -> Result<HandshakeState<Known, K1, K2, Known, Known>, chacha20poly1305::Error>
     where
-        EphKeyPair: Val<K1>,
-        PubKey: Val<K2>,
+        K1: Val2,
+        K2: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
@@ -399,8 +393,8 @@ impl Es {
 
 impl<K1, K2, K4> Send<Known, K1, K2, Known, K4, Responder> for Es
 where
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K2>,
+    K1: Val2,
+    K2: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
 {
@@ -438,8 +432,8 @@ impl Se {
         state: HandshakeState<K0, Known, Known, K3, K4>,
     ) -> Result<HandshakeState<K0, Known, Known, K3, Known>, chacha20poly1305::Error>
     where
-        KeyPair: Val<K0>,
-        PubKey: Val<K3>,
+        K0: Val2,
+        K3: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
@@ -459,8 +453,8 @@ impl Se {
 
 impl<K0, K3, K4> Send<K0, Known, Known, K3, K4, Responder> for Se
 where
-    KeyPair: Val<K0>,
-    PubKey: Val<K3>,
+    K0: Val2,
+    K3: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
 {
@@ -495,8 +489,8 @@ impl Se {
         state: HandshakeState<Known, K1, K2, Known, K4>,
     ) -> Result<HandshakeState<Known, K1, K2, Known, Known>, chacha20poly1305::Error>
     where
-        EphKeyPair: Val<K1>,
-        PubKey: Val<K2>,
+        K1: Val2,
+        K2: Val2,
         K4: Val2,
         CipherState<K4>: CipherStateAlg,
     {
@@ -516,8 +510,8 @@ impl Se {
 
 impl<K1, K2, K4> Send<Known, K1, K2, Known, K4, Initiator> for Se
 where
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K2>,
+    K1: Val2,
+    K2: Val2,
     K4: Val2,
     CipherState<K4>: CipherStateAlg,
 {
@@ -548,21 +542,17 @@ where
 
 pub trait Send<K0, K1, K2, K3, K4, S>
 where
-    KeyPair: Val<K0>,
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K2> + Val<K3>,
+    K0: Val2,
+    K1: Val2,
+    K2: Val2,
+    K3: Val2,
     K4: Val2,
     S: Sender,
-
-    KeyPair: Val<Self::NextK0>,
-    EphKeyPair: Val<Self::NextK1>,
-    PubKey: Val<Self::NextK2>,
-    PubKey: Val<Self::NextK3>,
 {
-    type NextK0;
-    type NextK1;
-    type NextK2;
-    type NextK3;
+    type NextK0: Val2;
+    type NextK1: Val2;
+    type NextK2: Val2;
+    type NextK3: Val2;
     type NextK4: Val2;
 
     fn send(
@@ -599,42 +589,6 @@ pub struct EphKeyPair(ReusableSecret);
 pub struct KeyPair(StaticSecret);
 pub struct PubKey(PublicKey);
 pub struct Key(chacha20poly1305::Key);
-
-pub trait Val<K> {
-    type T;
-}
-
-impl Val<Known> for EphKeyPair {
-    type T = EphKeyPair;
-}
-
-impl Val<Unknown> for EphKeyPair {
-    type T = ();
-}
-
-impl Val<Known> for KeyPair {
-    type T = KeyPair;
-}
-
-impl Val<Unknown> for KeyPair {
-    type T = ();
-}
-
-impl Val<Known> for PubKey {
-    type T = PubKey;
-}
-
-impl Val<Unknown> for PubKey {
-    type T = ();
-}
-
-impl Val<Known> for Key {
-    type T = Key;
-}
-
-impl Val<Unknown> for Key {
-    type T = ();
-}
 
 pub trait CipherStateAlg {
     fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut Vec<u8>);
@@ -848,22 +802,23 @@ pub struct SymmetricState {
 
 pub struct HandshakeState<K0, K1, K2, K3, K4>
 where
-    KeyPair: Val<K0>,
-    EphKeyPair: Val<K1>,
-    PubKey: Val<K2> + Val<K3>,
+    K0: Val2,
+    K1: Val2,
+    K2: Val2,
+    K3: Val2,
     K4: Val2,
 {
     cipher: CipherState<K4>,
     symm: SymmetricState,
 
     /// local static key pair
-    s: <KeyPair as Val<K0>>::T,
+    s: K0::Val<KeyPair>,
     /// local ephemeral key pair
-    e: <EphKeyPair as Val<K1>>::T,
+    e: K1::Val<EphKeyPair>,
     /// remote static public key
-    rs: <PubKey as Val<K2>>::T,
+    rs: K2::Val<PubKey>,
     /// remote ephemeral public key
-    re: <PubKey as Val<K3>>::T,
+    re: K3::Val<PubKey>,
 }
 
 #[cfg(test)]
@@ -884,9 +839,9 @@ mod tests {
                     ck: [0; 32],
                 },
                 s: KeyPair(StaticSecret::random()),
-                e: (),
-                rs: (),
-                re: (),
+                e: Unknown,
+                rs: Unknown,
+                re: Unknown,
             },
             Responder,
         );
@@ -905,9 +860,9 @@ mod tests {
                     ck: [0; 32],
                 },
                 s: KeyPair(StaticSecret::random()),
-                e: (),
+                e: Unknown,
                 rs: PubKey(PublicKey::from(&sk)),
-                re: (),
+                re: Unknown,
             },
             Initiator,
         );
@@ -930,7 +885,7 @@ mod tests {
                     ck: [0; 32],
                 },
                 s: KeyPair(StaticSecret::random()),
-                e: (),
+                e: Unknown,
                 rs: PubKey(PublicKey::from(&sk)),
                 re: PubKey(PublicKey::from(&ek)),
             },
