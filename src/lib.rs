@@ -37,11 +37,10 @@ where
 
     fn send(
         b: &mut Vec<u8>,
-        state: HandshakeState<K0, K1, K2, K3, K4>,
-        sender: S,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
-        let state = T::send(b, state, sender);
-        U::send(b, state, sender)
+        state: HandshakeState<K0, K1, K2, K3, K4, S>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
+        let state = T::send(b, state);
+        U::send(b, state)
     }
 }
 
@@ -65,11 +64,10 @@ where
 
     fn recv(
         b: &mut BytesMut,
-        state: HandshakeState<K0, K1, K2, K3, K4>,
-        sender: S,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
-        let state = T::recv(b, state, sender)?;
-        U::recv(b, state, sender)
+        state: HandshakeState<K0, K1, K2, K3, K4, S>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
+        let state = T::recv(b, state)?;
+        U::recv(b, state)
     }
 }
 
@@ -89,9 +87,8 @@ where
 
     fn recv(
         b: &mut BytesMut,
-        mut state: HandshakeState<K0, K1, Unknown, K3, K4>,
-        _sender: S_,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        mut state: HandshakeState<K0, K1, Unknown, K3, K4, S_>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S_>, Error> {
         // typecheck that rs is unknown
         let _: Unknown = state.rs;
 
@@ -104,13 +101,14 @@ where
             .decrypt_and_hash(&mut payload, &mut state.cipher)?;
         let pk = PublicKey::from(<[u8; 32]>::try_from(pk).unwrap());
 
-        Ok(HandshakeState::<K0, K1, Known, K3, K4> {
+        Ok(HandshakeState::<K0, K1, Known, K3, K4, S_> {
             cipher: state.cipher,
             symm: state.symm,
             s: state.s,
             e: state.e,
             rs: PubKey(pk),
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -128,9 +126,8 @@ where
 
     fn send(
         b: &mut Vec<u8>,
-        mut state: HandshakeState<Known, K1, K2, K3, K4>,
-        _sender: S_,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        mut state: HandshakeState<Known, K1, K2, K3, K4, S_>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S_> {
         let pk = PublicKey::from(&state.s.0);
         state
             .symm
@@ -154,9 +151,8 @@ where
 
     fn recv(
         b: &mut BytesMut,
-        mut state: HandshakeState<K0, K1, K2, Unknown, K4>,
-        _sender: S,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<K0, K1, K2, Unknown, K4, S>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
         // typecheck that re is unknown
         let _: Unknown = state.re;
 
@@ -164,16 +160,17 @@ where
             return Err(chacha20poly1305::Error);
         }
         let payload = b.split_to(32);
-        state.symm = state.symm.mix_hash(&payload);
+        let symm = state.symm.mix_hash(&payload);
         let pk = PublicKey::from(<[u8; 32]>::try_from(&*payload).unwrap());
 
-        Ok(HandshakeState::<K0, K1, K2, Known, K4> {
+        Ok(HandshakeState::<K0, K1, K2, Known, K4, S> {
             cipher: state.cipher,
-            symm: state.symm,
+            symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: PubKey(pk),
+            sender: state.sender,
         })
     }
 }
@@ -190,21 +187,21 @@ where
 
     fn send(
         b: &mut Vec<u8>,
-        state: HandshakeState<K0, Unknown, K2, K3, K4>,
-        _sender: S,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<K0, Unknown, K2, K3, K4, S>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
         let ek = ReusableSecret::random();
         let pk = PublicKey::from(&ek);
         b.extend_from_slice(pk.as_bytes());
         let symm = state.symm.mix_hash(pk.as_bytes());
 
-        HandshakeState::<K0, Known, K2, K3, K4> {
+        HandshakeState::<K0, Known, K2, K3, K4, S> {
             cipher: state.cipher,
             symm,
             s: state.s,
             e: EphKeyPair(ek),
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -224,19 +221,19 @@ where
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<K0, Known, K2, Known, K4>,
-        _sender: S,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<K0, Known, K2, Known, K4, S>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
         let dh = state.e.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<K0, Known, K2, Known, Known> {
+        Ok(HandshakeState::<K0, Known, K2, Known, Known, S> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -253,19 +250,19 @@ where
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<K0, Known, K2, Known, K4>,
-        _sender: S,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<K0, Known, K2, Known, K4, S>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
         let dh = state.e.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<K0, Known, K2, Known, Known> {
+        HandshakeState::<K0, Known, K2, Known, Known, S> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -285,19 +282,19 @@ where
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<Known, K1, Known, K3, K4>,
-        _sender: S,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<Known, K1, Known, K3, K4, S>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error> {
         let dh = state.s.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<Known, K1, Known, K3, Known> {
+        Ok(HandshakeState::<Known, K1, Known, K3, Known, S> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -314,19 +311,19 @@ where
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<Known, K1, Known, K3, K4>,
-        _sender: S,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<Known, K1, Known, K3, K4, S>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S> {
         let dh = state.s.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<Known, K1, Known, K3, Known> {
+        HandshakeState::<Known, K1, Known, K3, Known, S> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -343,19 +340,20 @@ impl<K0: Val, K3: Val, K4: Val> Recv<K0, Known, Known, K3, K4, Initiator> for Es
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<K0, Known, Known, K3, K4>,
-        _sender: Initiator,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<K0, Known, Known, K3, K4, Initiator>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator>, Error>
+    {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<K0, Known, Known, K3, Known> {
+        Ok(HandshakeState::<K0, Known, Known, K3, Known, Initiator> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -369,19 +367,19 @@ impl<K0: Val, K3: Val, K4: Val> Send<K0, Known, Known, K3, K4, Initiator> for Es
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<K0, Known, Known, K3, K4>,
-        _sender: Initiator,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<K0, Known, Known, K3, K4, Initiator>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<K0, Known, Known, K3, Known> {
+        HandshakeState::<K0, Known, Known, K3, Known, Initiator> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -395,19 +393,20 @@ impl<K1: Val, K2: Val, K4: Val> Recv<Known, K1, K2, Known, K4, Responder> for Es
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<Known, K1, K2, Known, K4>,
-        _sender: Responder,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<Known, K1, K2, Known, K4, Responder>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder>, Error>
+    {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<Known, K1, K2, Known, Known> {
+        Ok(HandshakeState::<Known, K1, K2, Known, Known, Responder> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -421,19 +420,19 @@ impl<K1: Val, K2: Val, K4: Val> Send<Known, K1, K2, Known, K4, Responder> for Es
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<Known, K1, K2, Known, K4>,
-        _sender: Responder,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<Known, K1, K2, Known, K4, Responder>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<Known, K1, K2, Known, Known> {
+        HandshakeState::<Known, K1, K2, Known, Known, Responder> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -450,19 +449,20 @@ impl<K0: Val, K3: Val, K4: Val> Recv<K0, Known, Known, K3, K4, Responder> for Se
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<K0, Known, Known, K3, K4>,
-        _sender: Responder,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<K0, Known, Known, K3, K4, Responder>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder>, Error>
+    {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<K0, Known, Known, K3, Known> {
+        Ok(HandshakeState::<K0, Known, Known, K3, Known, Responder> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -476,19 +476,19 @@ impl<K0: Val, K3: Val, K4: Val> Send<K0, Known, Known, K3, K4, Responder> for Se
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<K0, Known, Known, K3, K4>,
-        _sender: Responder,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<K0, Known, Known, K3, K4, Responder>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Responder> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<K0, Known, Known, K3, Known> {
+        HandshakeState::<K0, Known, Known, K3, Known, Responder> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -502,19 +502,20 @@ impl<K1: Val, K2: Val, K4: Val> Recv<Known, K1, K2, Known, K4, Initiator> for Se
 
     fn recv(
         _b: &mut BytesMut,
-        state: HandshakeState<Known, K1, K2, Known, K4>,
-        _sender: Initiator,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error> {
+        state: HandshakeState<Known, K1, K2, Known, K4, Initiator>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator>, Error>
+    {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        Ok(HandshakeState::<Known, K1, K2, Known, Known> {
+        Ok(HandshakeState::<Known, K1, K2, Known, Known, Initiator> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         })
     }
 }
@@ -528,19 +529,19 @@ impl<K1: Val, K2: Val, K4: Val> Send<Known, K1, K2, Known, K4, Initiator> for Se
 
     fn send(
         _b: &mut Vec<u8>,
-        state: HandshakeState<Known, K1, K2, Known, K4>,
-        _sender: Initiator,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4> {
+        state: HandshakeState<Known, K1, K2, Known, K4, Initiator>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, Initiator> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
-        HandshakeState::<Known, K1, K2, Known, Known> {
+        HandshakeState::<Known, K1, K2, Known, Known, Initiator> {
             cipher,
             symm,
             s: state.s,
             e: state.e,
             rs: state.rs,
             re: state.re,
+            sender: state.sender,
         }
     }
 }
@@ -557,9 +558,8 @@ where
 
     fn send(
         b: &mut Vec<u8>,
-        state: HandshakeState<K0, K1, K2, K3, K4>,
-        _sender: S,
-    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>;
+        state: HandshakeState<K0, K1, K2, K3, K4, S>,
+    ) -> HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>;
 }
 
 pub type Error = chacha20poly1305::Error;
@@ -576,15 +576,12 @@ where
 
     fn recv(
         b: &mut BytesMut,
-        state: HandshakeState<K0, K1, K2, K3, K4>,
-        _sender: S,
-    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4>, Error>;
+        state: HandshakeState<K0, K1, K2, K3, K4, S>,
+    ) -> Result<HandshakeState<Self::K0, Self::K1, Self::K2, Self::K3, Self::K4, S>, Error>;
 }
 
-pub trait Sender: Copy {}
-#[derive(Clone, Copy)]
+pub trait Sender {}
 pub struct Initiator;
-#[derive(Clone, Copy)]
 pub struct Responder;
 
 impl Sender for Initiator {}
@@ -819,14 +816,7 @@ pub struct SymmetricState {
     h: [u8; 32],
 }
 
-pub struct HandshakeState<K0, K1, K2, K3, K4>
-where
-    K0: Val,
-    K1: Val,
-    K2: Val,
-    K3: Val,
-    K4: Val,
-{
+pub struct HandshakeState<K0: Val, K1: Val, K2: Val, K3: Val, K4: Val, S: Sender> {
     cipher: CipherState<K4>,
     symm: SymmetricState,
 
@@ -838,6 +828,8 @@ where
     rs: K2::Val<PubKey>,
     /// remote ephemeral public key
     re: K3::Val<PubKey>,
+
+    sender: S,
 }
 
 #[cfg(test)]
@@ -848,73 +840,8 @@ mod tests {
     type IkMsg1 = hlist![E, Ee, Se];
 
     #[test]
-    fn check_ik_pre0() {
-        IkPre0::send(
-            &mut vec![],
-            HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown> {
-                cipher: CipherState { k: Unknown, n: 0 },
-                symm: SymmetricState {
-                    h: [0; 32],
-                    ck: [0; 32],
-                },
-                s: KeyPair(StaticSecret::random()),
-                e: Unknown,
-                rs: Unknown,
-                re: Unknown,
-            },
-            Responder,
-        );
-    }
-
-    #[test]
-    fn check_ik_msg0() {
-        let sk = StaticSecret::random();
-
-        IkMsg0::send(
-            &mut vec![],
-            HandshakeState::<Known, Unknown, Known, Unknown, Unknown> {
-                cipher: CipherState { k: Unknown, n: 0 },
-                symm: SymmetricState {
-                    h: [0; 32],
-                    ck: [0; 32],
-                },
-                s: KeyPair(StaticSecret::random()),
-                e: Unknown,
-                rs: PubKey(PublicKey::from(&sk)),
-                re: Unknown,
-            },
-            Initiator,
-        );
-    }
-
-    #[test]
-    fn check_ik_msg1() {
-        let ek = ReusableSecret::random();
-        let sk = StaticSecret::random();
-
-        IkMsg1::send(
-            &mut vec![],
-            HandshakeState::<Known, Unknown, Known, Known, Known> {
-                cipher: CipherState {
-                    k: Key(Default::default()),
-                    n: 0,
-                },
-                symm: SymmetricState {
-                    h: [0; 32],
-                    ck: [0; 32],
-                },
-                s: KeyPair(StaticSecret::random()),
-                e: Unknown,
-                rs: PubKey(PublicKey::from(&sk)),
-                re: PubKey(PublicKey::from(&ek)),
-            },
-            Responder,
-        );
-    }
-
-    #[test]
     fn check_ik_full() {
-        let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown> {
+        let hs_init = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Initiator> {
             cipher: CipherState { k: Unknown, n: 0 },
             symm: SymmetricState {
                 h: [0; 32],
@@ -924,9 +851,10 @@ mod tests {
             e: Unknown,
             rs: Unknown,
             re: Unknown,
+            sender: Initiator,
         };
 
-        let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown> {
+        let hs_resp = HandshakeState::<Known, Unknown, Unknown, Unknown, Unknown, Responder> {
             cipher: CipherState { k: Unknown, n: 0 },
             symm: SymmetricState {
                 h: [0; 32],
@@ -936,19 +864,20 @@ mod tests {
             e: Unknown,
             rs: Unknown,
             re: Unknown,
+            sender: Responder,
         };
 
         let mut msg = vec![];
-        let hs_resp = IkPre0::send(&mut msg, hs_resp, Responder);
-        let hs_init = IkPre0::recv(&mut BytesMut::from(&*msg), hs_init, Initiator).unwrap();
+        let hs_resp = IkPre0::send(&mut msg, hs_resp);
+        let hs_init = IkPre0::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
 
         let mut msg = vec![];
-        let hs_init = IkMsg0::send(&mut msg, hs_init, Initiator);
-        let hs_resp = IkMsg0::recv(&mut BytesMut::from(&*msg), hs_resp, Responder).unwrap();
+        let hs_init = IkMsg0::send(&mut msg, hs_init);
+        let hs_resp = IkMsg0::recv(&mut BytesMut::from(&*msg), hs_resp).unwrap();
 
         let mut msg = vec![];
-        let hs_resp = IkMsg1::send(&mut msg, hs_resp, Responder);
-        let hs_init = IkMsg1::recv(&mut BytesMut::from(&*msg), hs_init, Initiator).unwrap();
+        let hs_resp = IkMsg1::send(&mut msg, hs_resp);
+        let hs_init = IkMsg1::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
 
         assert_eq!(hs_init.cipher.k.0, hs_resp.cipher.k.0);
         assert_eq!(hs_init.symm.ck, hs_resp.symm.ck);
