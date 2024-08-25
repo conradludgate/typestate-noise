@@ -133,7 +133,11 @@ impl<St: States<EphemeralKey = Unknown> + ?Sized> Send<St> for E {
     type St = <St as StatesExt>::WithEphemeralKey;
 
     fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
+        #[cfg(typestate_noise_vectors)]
+        let ek = StaticSecret::random();
+        #[cfg(not(typestate_noise_vectors))]
         let ek = ReusableSecret::random();
+
         let pk = PublicKey::from(&ek);
         b.extend_from_slice(pk.as_bytes());
         let symm = state.symm.mix_hash(pk.as_bytes());
@@ -143,6 +147,39 @@ impl<St: States<EphemeralKey = Unknown> + ?Sized> Send<St> for E {
             symm,
             s: state.s,
             e: EphKeyPair(ek),
+            rs: state.rs,
+            re: state.re,
+        }
+    }
+}
+
+#[cfg(typestate_noise_vectors)]
+type ETest<K0, K2, K3, K4, S> = dyn States<
+    StaticKey = K0,
+    EphemeralKey = Known,
+    RemoteStaticKey = K2,
+    RemoteEphemeralKey = K3,
+    EncryptionKey = K4,
+    Side = S,
+>;
+
+#[cfg(typestate_noise_vectors)]
+impl<K0: Val, K2: Val, K3: Val, K4: Val, S: Sender> Send<ETest<K0, K2, K3, K4, S>> for E {
+    type St = ETest<K0, K2, K3, K4, S>;
+
+    fn send(
+        b: &mut Vec<u8>,
+        state: HandshakeState<ETest<K0, K2, K3, K4, S>>,
+    ) -> HandshakeState<Self::St> {
+        let pk = PublicKey::from(&state.e.0);
+        b.extend_from_slice(pk.as_bytes());
+        let symm = state.symm.mix_hash(pk.as_bytes());
+
+        HandshakeState::<Self::St> {
+            cipher: state.cipher,
+            symm,
+            s: state.s,
+            e: state.e,
             rs: state.rs,
             re: state.re,
         }
@@ -530,11 +567,13 @@ impl Val for Known {
 impl Val for Unknown {
     type Val<T> = Unknown;
 }
-
+#[cfg(not(typestate_noise_vectors))]
 pub struct EphKeyPair(ReusableSecret);
+#[cfg(typestate_noise_vectors)]
+pub struct EphKeyPair(StaticSecret);
 pub struct KeyPair(StaticSecret);
 pub struct PubKey(PublicKey);
-pub struct Key(chacha20poly1305::Key);
+pub struct Key(pub chacha20poly1305::Key);
 
 pub trait CipherStateAlg {
     fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut Vec<u8>);
@@ -734,9 +773,9 @@ where
     K: Val,
 {
     /// cipher key
-    k: K::Val<Key>,
+    pub k: K::Val<Key>,
     /// nonce
-    n: u64,
+    pub n: u64,
 }
 
 impl Default for CipherState<Unknown> {
@@ -747,9 +786,9 @@ impl Default for CipherState<Unknown> {
 
 pub struct SymmetricState {
     /// chaining key
-    ck: [u8; 32],
+    pub ck: [u8; 32],
     /// hash
-    h: [u8; 32],
+    pub h: [u8; 32],
 }
 
 impl SymmetricState {
@@ -767,8 +806,8 @@ impl SymmetricState {
 }
 
 pub struct HandshakeState<St: States + ?Sized> {
-    cipher: CipherState<St::EncryptionKey>,
-    symm: SymmetricState,
+    pub cipher: CipherState<St::EncryptionKey>,
+    pub symm: SymmetricState,
 
     /// local static key pair
     s: <St::StaticKey as Val>::Val<KeyPair>,
@@ -838,6 +877,23 @@ impl<St: States<StaticKey = Unknown> + ?Sized> HandshakeState<St> {
             symm: self.symm,
             s: KeyPair(key),
             e: self.e,
+            rs: self.rs,
+            re: self.re,
+        }
+    }
+}
+
+#[cfg(typestate_noise_vectors)]
+impl<St: States<EphemeralKey = Unknown> + ?Sized> HandshakeState<St> {
+    pub fn with_ephemeral_key(
+        self,
+        key: StaticSecret,
+    ) -> HandshakeState<<St as StatesExt>::WithEphemeralKey> {
+        HandshakeState {
+            cipher: self.cipher,
+            symm: self.symm,
+            s: self.s,
+            e: EphKeyPair(key),
             rs: self.rs,
             re: self.re,
         }

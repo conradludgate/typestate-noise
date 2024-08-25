@@ -4,8 +4,29 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-x25519-dalek = { version = "2", features = ["reusable_secrets", "static_secrets","getrandom"] }
+x25519-dalek = { version = "2", features = [
+    "reusable_secrets",
+    "static_secrets",
+    "getrandom",
+] }
 chacha20poly1305 = "0.10"
 sha2 = "0.10"
 bytes = "1"
 hmac = "0.12"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = [
+    'cfg(typestate_noise_vectors)',
+] }
+
+[dev-dependencies]
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+hex = { version = "0.4", features = ["serde"] }
+
+libtest-mimic = "0.7.3"
+
+[[test]]
+name = "vectors"
+path = "tests/vectors.rs"
+harness = false
