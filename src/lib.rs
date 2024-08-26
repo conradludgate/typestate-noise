@@ -17,32 +17,98 @@ macro_rules! hlist {
     };
 }
 
-impl<T, U, St: States + ?Sized> Send<St> for HList<T, U>
+impl<T, U, St: States + ?Sized> SendPreMsg<St> for HList<T, U>
 where
-    T: Send<St>,
-    U: Send<T::St>,
+    T: SendPreMsg<St>,
+    U: SendPreMsg<T::St>,
 {
     type St = U::St;
 
-    fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<U::St> {
-        let state = T::send(b, state);
-        U::send(b, state)
+    fn send_premsg(b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<U::St> {
+        let state = T::send_premsg(b, state);
+        U::send_premsg(b, state)
     }
 }
 
-impl<T, U, St: States + ?Sized> Recv<St> for HList<T, U>
+impl<T, U, St: States + ?Sized> RecvPreMsg<St> for HList<T, U>
 where
-    T: Recv<St>,
-    U: Recv<T::St>,
+    T: RecvPreMsg<St>,
+    U: RecvPreMsg<T::St>,
 {
     type St = U::St;
 
-    fn recv(
+    fn recv_premsg(
         b: &mut BytesMut,
         state: HandshakeState<St>,
     ) -> Result<HandshakeState<Self::St>, Error> {
+        let state = T::recv_premsg(b, state)?;
+        U::recv_premsg(b, state)
+    }
+}
+
+impl<T, U, St: States + ?Sized> SendWithPayload<St> for HList<T, U>
+where
+    T: Send<St>,
+    U: SendWithPayload<T::St>,
+{
+    type St = U::St;
+
+    fn send_with_payload(
+        b: &mut BytesMut,
+        state: HandshakeState<St>,
+        payload: &[u8],
+    ) -> HandshakeState<U::St> {
+        let state = T::send(b, state);
+        U::send_with_payload(b, state, payload)
+    }
+}
+
+impl<T, U, St: States + ?Sized> RecvWithPayload<St> for HList<T, U>
+where
+    T: Recv<St>,
+    U: RecvWithPayload<T::St>,
+{
+    type St = U::St;
+
+    fn recv_with_payload(
+        b: &mut BytesMut,
+        state: HandshakeState<St>,
+    ) -> Result<(HandshakeState<Self::St>, BytesMut), Error> {
         let state = T::recv(b, state)?;
-        U::recv(b, state)
+        U::recv_with_payload(b, state)
+    }
+}
+
+pub struct Payload;
+
+impl<St: States + ?Sized> SendWithPayload<St> for Payload
+where
+    CipherState<St::EncryptionKey>: CipherStateAlg,
+{
+    type St = St;
+
+    fn send_with_payload(
+        b: &mut BytesMut,
+        mut state: HandshakeState<St>,
+        payload: &[u8],
+    ) -> HandshakeState<Self::St> {
+        state.symm.encrypt_and_hash(payload, b, &mut state.cipher);
+        state
+    }
+}
+
+impl<St: States + ?Sized> RecvWithPayload<St> for Payload
+where
+    CipherState<St::EncryptionKey>: CipherStateAlg,
+{
+    type St = St;
+
+    fn recv_with_payload(
+        b: &mut BytesMut,
+        mut state: HandshakeState<St>,
+    ) -> Result<(HandshakeState<Self::St>, BytesMut), Error> {
+        let b = state.symm.decrypt_and_hash(b.split(), &mut state.cipher)?;
+        Ok((state, b))
     }
 }
 
@@ -65,11 +131,9 @@ where
         if b.len() < 32 + state.cipher.tag_len() {
             return Err(chacha20poly1305::Error);
         }
-        let mut payload = b.split_to(32 + state.cipher.tag_len());
-        let pk = state
-            .symm
-            .decrypt_and_hash(&mut payload, &mut state.cipher)?;
-        let pk = PublicKey::from(<[u8; 32]>::try_from(pk).unwrap());
+        let payload = b.split_to(32 + state.cipher.tag_len());
+        let pk = state.symm.decrypt_and_hash(payload, &mut state.cipher)?;
+        let pk = PublicKey::from(<[u8; 32]>::try_from(&*pk).unwrap());
 
         Ok(HandshakeState::<Self::St> {
             cipher: state.cipher,
@@ -88,9 +152,45 @@ where
 {
     type St = St;
 
-    fn send(b: &mut Vec<u8>, mut state: HandshakeState<St>) -> HandshakeState<St> {
+    fn send(b: &mut BytesMut, mut state: HandshakeState<St>) -> HandshakeState<St> {
         let pk = PublicKey::from(&state.s.0).to_bytes();
         state.symm.encrypt_and_hash(&pk, b, &mut state.cipher);
+        state
+    }
+}
+
+impl<St: States<RemoteStaticKey = Unknown, EncryptionKey = Unknown> + ?Sized> RecvPreMsg<St> for S {
+    type St = <St as StatesExt>::WithRemoteStaticKey;
+
+    fn recv_premsg(
+        b: &mut BytesMut,
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error> {
+        if b.len() < 32 + state.cipher.tag_len() {
+            return Err(chacha20poly1305::Error);
+        }
+        let payload = b.split_to(32);
+        state.symm.mix_hash(&payload);
+        let pk = PublicKey::from(<[u8; 32]>::try_from(&*payload).unwrap());
+
+        Ok(HandshakeState::<Self::St> {
+            cipher: state.cipher,
+            symm: state.symm,
+            s: state.s,
+            e: state.e,
+            rs: PubKey(pk),
+            re: state.re,
+        })
+    }
+}
+
+impl<St: States<StaticKey = Known, EncryptionKey = Unknown> + ?Sized> SendPreMsg<St> for S {
+    type St = St;
+
+    fn send_premsg(b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<St> {
+        let pk = PublicKey::from(&state.s.0).to_bytes();
+        b.extend_from_slice(&pk);
+        state.symm.mix_hash(&pk);
         state
     }
 }
@@ -132,10 +232,10 @@ where
 impl<St: States<EphemeralKey = Unknown> + ?Sized> Send<St> for E {
     type St = <St as StatesExt>::WithEphemeralKey;
 
-    fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
-        #[cfg(typestate_noise_vectors)]
+    fn send(b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<Self::St> {
+        #[cfg(unsafe_typestate_noise_vectors)]
         let ek = StaticSecret::random();
-        #[cfg(not(typestate_noise_vectors))]
+        #[cfg(not(unsafe_typestate_noise_vectors))]
         let ek = ReusableSecret::random();
 
         let pk = PublicKey::from(&ek);
@@ -153,7 +253,7 @@ impl<St: States<EphemeralKey = Unknown> + ?Sized> Send<St> for E {
     }
 }
 
-#[cfg(typestate_noise_vectors)]
+#[cfg(unsafe_typestate_noise_vectors)]
 type ETest<K0, K2, K3, K4, S> = dyn States<
     StaticKey = K0,
     EphemeralKey = Known,
@@ -163,12 +263,12 @@ type ETest<K0, K2, K3, K4, S> = dyn States<
     Side = S,
 >;
 
-#[cfg(typestate_noise_vectors)]
+#[cfg(unsafe_typestate_noise_vectors)]
 impl<K0: Val, K2: Val, K3: Val, K4: Val, S: Sender> Send<ETest<K0, K2, K3, K4, S>> for E {
     type St = ETest<K0, K2, K3, K4, S>;
 
     fn send(
-        b: &mut Vec<u8>,
+        b: &mut BytesMut,
         state: HandshakeState<ETest<K0, K2, K3, K4, S>>,
     ) -> HandshakeState<Self::St> {
         let pk = PublicKey::from(&state.e.0);
@@ -213,7 +313,7 @@ impl<St: States<EphemeralKey = Known, RemoteEphemeralKey = Known> + ?Sized> Recv
 impl<St: States<EphemeralKey = Known, RemoteEphemeralKey = Known> + ?Sized> Send<St> for Ee {
     type St = <St as StatesExt>::WithEncryptionKey;
 
-    fn send(_b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
+    fn send(_b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let dh = state.e.0.diffie_hellman(&state.re.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
@@ -255,7 +355,7 @@ impl<St: States<StaticKey = Known, RemoteStaticKey = Known> + ?Sized> Recv<St> f
 impl<St: States<StaticKey = Known, RemoteStaticKey = Known> + ?Sized> Send<St> for Ss {
     type St = <St as StatesExt>::WithEncryptionKey;
 
-    fn send(_b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
+    fn send(_b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let dh = state.s.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
@@ -301,7 +401,7 @@ impl<St: States<EphemeralKey = Known, RemoteStaticKey = Known, Side = Initiator>
 {
     type St = <St as StatesExt>::WithEncryptionKey;
 
-    fn send(_b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St> {
+    fn send(_b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<Self::St> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
         let (symm, cipher) = state.symm.mix_key(dh.as_bytes());
 
@@ -350,7 +450,7 @@ impl<K1: Val, K2: Val, K4: Val> Send<EsResp<K1, K2, K4>> for Es {
     type St = <EsResp<K1, K2, K4> as StatesExt>::WithEncryptionKey;
 
     fn send(
-        _b: &mut Vec<u8>,
+        _b: &mut BytesMut,
         state: HandshakeState<EsResp<K1, K2, K4>>,
     ) -> HandshakeState<Self::St> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
@@ -404,7 +504,7 @@ impl<K0: Val, K3: Val, K4: Val> Send<SeResp<K0, K3, K4>> for Se {
     type St = <SeResp<K0, K3, K4> as StatesExt>::WithEncryptionKey;
 
     fn send(
-        _b: &mut Vec<u8>,
+        _b: &mut BytesMut,
         state: HandshakeState<SeResp<K0, K3, K4>>,
     ) -> HandshakeState<Self::St> {
         let dh = state.e.0.diffie_hellman(&state.rs.0);
@@ -455,7 +555,7 @@ impl<K1: Val, K2: Val, K4: Val> Send<EsInit<K1, K2, K4>> for Se {
     type St = <EsInit<K1, K2, K4> as StatesExt>::WithEncryptionKey;
 
     fn send(
-        _b: &mut Vec<u8>,
+        _b: &mut BytesMut,
         state: HandshakeState<EsInit<K1, K2, K4>>,
     ) -> HandshakeState<Self::St> {
         let dh = state.s.0.diffie_hellman(&state.re.0);
@@ -535,7 +635,23 @@ impl<St: States + ?Sized> StatesExt for St {
 pub trait Send<St: States + ?Sized> {
     type St: States + ?Sized;
 
-    fn send(b: &mut Vec<u8>, state: HandshakeState<St>) -> HandshakeState<Self::St>;
+    fn send(b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<Self::St>;
+}
+
+pub trait SendPreMsg<St: States + ?Sized> {
+    type St: States + ?Sized;
+
+    fn send_premsg(b: &mut BytesMut, state: HandshakeState<St>) -> HandshakeState<Self::St>;
+}
+
+pub trait SendWithPayload<St: States + ?Sized> {
+    type St: States + ?Sized;
+
+    fn send_with_payload(
+        b: &mut BytesMut,
+        state: HandshakeState<St>,
+        payload: &[u8],
+    ) -> HandshakeState<Self::St>;
 }
 
 pub type Error = chacha20poly1305::Error;
@@ -545,6 +661,24 @@ pub trait Recv<St: States + ?Sized> {
 
     fn recv(b: &mut BytesMut, state: HandshakeState<St>)
         -> Result<HandshakeState<Self::St>, Error>;
+}
+
+pub trait RecvPreMsg<St: States + ?Sized> {
+    type St: States + ?Sized;
+
+    fn recv_premsg(
+        b: &mut BytesMut,
+        state: HandshakeState<St>,
+    ) -> Result<HandshakeState<Self::St>, Error>;
+}
+
+pub trait RecvWithPayload<St: States + ?Sized> {
+    type St: States + ?Sized;
+
+    fn recv_with_payload(
+        b: &mut BytesMut,
+        state: HandshakeState<St>,
+    ) -> Result<(HandshakeState<Self::St>, BytesMut), Error>;
 }
 
 pub trait Sender {}
@@ -567,27 +701,27 @@ impl Val for Known {
 impl Val for Unknown {
     type Val<T> = Unknown;
 }
-#[cfg(not(typestate_noise_vectors))]
+#[cfg(not(unsafe_typestate_noise_vectors))]
 pub struct EphKeyPair(ReusableSecret);
-#[cfg(typestate_noise_vectors)]
+#[cfg(unsafe_typestate_noise_vectors)]
 pub struct EphKeyPair(StaticSecret);
 pub struct KeyPair(StaticSecret);
 pub struct PubKey(PublicKey);
 pub struct Key(pub chacha20poly1305::Key);
 
 pub trait CipherStateAlg {
-    fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut Vec<u8>);
-    fn decrypt_with_ad<'a>(
+    fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut BytesMut);
+    fn decrypt_with_ad(
         &mut self,
         ad: &[u8],
-        ciphertext: &'a mut [u8],
-    ) -> Result<&'a mut [u8], chacha20poly1305::Error>;
+        ciphertext: BytesMut,
+    ) -> Result<BytesMut, chacha20poly1305::Error>;
     fn has_key(&self) -> bool;
     fn tag_len(&self) -> usize;
 }
 
 impl CipherStateAlg for CipherState<Known> {
-    fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut Vec<u8>) {
+    fn encrypt_with_ad(&mut self, ad: &[u8], plaintext: &[u8], ciphertext: &mut BytesMut) {
         use chacha20poly1305::{AeadInPlace, KeyInit};
 
         let l = ciphertext.len();
@@ -603,30 +737,31 @@ impl CipherStateAlg for CipherState<Known> {
         ciphertext.extend_from_slice(&tag);
     }
 
-    fn decrypt_with_ad<'a>(
+    fn decrypt_with_ad(
         &mut self,
         ad: &[u8],
-        ciphertext: &'a mut [u8],
-    ) -> Result<&'a mut [u8], chacha20poly1305::Error> {
+        mut ciphertext: BytesMut,
+    ) -> Result<BytesMut, chacha20poly1305::Error> {
         use chacha20poly1305::{AeadInPlace, KeyInit};
 
-        let (plaintext, tag) = ciphertext
-            .split_at_mut_checked(ciphertext.len() - 16)
-            .ok_or(chacha20poly1305::Error)?;
-        let tag = Tag::from_slice(tag);
+        if ciphertext.len() < 16 {
+            return Err(chacha20poly1305::Error);
+        }
+        let tag = ciphertext.split_off(ciphertext.len() - 16);
+        let tag = Tag::from_slice(&tag);
 
         let n = self.n;
 
         ChaCha20Poly1305::new(&self.k.0).decrypt_in_place_detached(
             &nonce(n),
             ad,
-            plaintext,
+            &mut ciphertext,
             tag,
         )?;
 
         self.n += 1;
 
-        Ok(plaintext)
+        Ok(ciphertext)
     }
 
     fn has_key(&self) -> bool {
@@ -639,15 +774,15 @@ impl CipherStateAlg for CipherState<Known> {
 }
 
 impl CipherStateAlg for CipherState<Unknown> {
-    fn encrypt_with_ad(&mut self, _ad: &[u8], plaintext: &[u8], ciphertext: &mut Vec<u8>) {
+    fn encrypt_with_ad(&mut self, _ad: &[u8], plaintext: &[u8], ciphertext: &mut BytesMut) {
         ciphertext.extend_from_slice(plaintext);
     }
 
-    fn decrypt_with_ad<'a>(
+    fn decrypt_with_ad(
         &mut self,
         _ad: &[u8],
-        ciphertext: &'a mut [u8],
-    ) -> Result<&'a mut [u8], chacha20poly1305::Error> {
+        ciphertext: BytesMut,
+    ) -> Result<BytesMut, chacha20poly1305::Error> {
         Ok(ciphertext)
     }
 
@@ -709,7 +844,7 @@ impl SymmetricState {
     fn encrypt_and_hash<K>(
         &mut self,
         plaintext: &[u8],
-        ciphertext: &mut Vec<u8>,
+        ciphertext: &mut BytesMut,
         c: &mut CipherState<K>,
     ) where
         K: Val,
@@ -720,16 +855,16 @@ impl SymmetricState {
         *self = self.mix_hash(&ciphertext[l..]);
     }
 
-    fn decrypt_and_hash<'a, K>(
+    fn decrypt_and_hash<K>(
         &mut self,
-        ciphertext: &'a mut [u8],
+        ciphertext: BytesMut,
         c: &mut CipherState<K>,
-    ) -> Result<&'a mut [u8], chacha20poly1305::Error>
+    ) -> Result<BytesMut, chacha20poly1305::Error>
     where
         K: Val,
         CipherState<K>: CipherStateAlg,
     {
-        let new = self.mix_hash(ciphertext);
+        let new = self.mix_hash(&ciphertext);
         let p = c.decrypt_with_ad(&self.h, ciphertext)?;
         *self = new;
 
@@ -793,7 +928,7 @@ pub struct SymmetricState {
 
 impl SymmetricState {
     pub fn new(protocol: &str) -> Self {
-        let h = if protocol.len() < 32 {
+        let h = if protocol.len() <= 32 {
             let mut h = [0; 32];
             h[..protocol.len()].copy_from_slice(protocol.as_bytes());
             h
@@ -817,6 +952,25 @@ pub struct HandshakeState<St: States + ?Sized> {
     rs: <St::RemoteStaticKey as Val>::Val<PubKey>,
     /// remote ephemeral public key
     re: <St::RemoteEphemeralKey as Val>::Val<PubKey>,
+}
+
+impl<St: States + ?Sized> HandshakeState<St> {
+    pub fn with_prologue(mut self, b: &[u8]) -> Self {
+        self.symm = self.symm.mix_hash(b);
+        self
+    }
+}
+
+impl<St: States<EncryptionKey = Known> + ?Sized> HandshakeState<St> {
+    pub fn encrypt_payload(&mut self, plaintext: &[u8], b: &mut BytesMut) {
+        self.symm.encrypt_and_hash(plaintext, b, &mut self.cipher);
+    }
+    pub fn decrypt_payload(
+        &mut self,
+        ciphertext: BytesMut,
+    ) -> Result<BytesMut, chacha20poly1305::Error> {
+        self.symm.decrypt_and_hash(ciphertext, &mut self.cipher)
+    }
 }
 
 impl
@@ -883,7 +1037,7 @@ impl<St: States<StaticKey = Unknown> + ?Sized> HandshakeState<St> {
     }
 }
 
-#[cfg(typestate_noise_vectors)]
+#[cfg(unsafe_typestate_noise_vectors)]
 impl<St: States<EphemeralKey = Unknown> + ?Sized> HandshakeState<St> {
     pub fn with_ephemeral_key(
         self,
@@ -902,30 +1056,34 @@ impl<St: States<EphemeralKey = Unknown> + ?Sized> HandshakeState<St> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
 
     #[test]
     fn check_ik() {
         type IkPre0 = hlist![S];
-        type IkMsg0 = hlist![E, Es, S, Ss];
-        type IkMsg1 = hlist![E, Ee, Se];
+        type IkMsg0 = hlist![E, Es, S, Ss, Payload];
+        type IkMsg1 = hlist![E, Ee, Se, Payload];
 
         let hs_init = HandshakeState::initiator("Noise_IK_25519_ChaChaPoly_SHA256")
             .with_static_key(StaticSecret::random());
         let hs_resp = HandshakeState::responder("Noise_IK_25519_ChaChaPoly_SHA256")
             .with_static_key(StaticSecret::random());
 
-        let mut msg = vec![];
-        let hs_resp = IkPre0::send(&mut msg, hs_resp);
-        let hs_init = IkPre0::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
+        let mut msg = BytesMut::new();
+        let hs_resp = IkPre0::send_premsg(&mut msg, hs_resp);
+        let hs_init = IkPre0::recv_premsg(&mut msg, hs_init).unwrap();
 
-        let mut msg = vec![];
-        let hs_init = IkMsg0::send(&mut msg, hs_init);
-        let hs_resp = IkMsg0::recv(&mut BytesMut::from(&*msg), hs_resp).unwrap();
+        let mut msg = BytesMut::new();
+        let hs_init = IkMsg0::send_with_payload(&mut msg, hs_init, b"hello");
+        let (hs_resp, data) = IkMsg0::recv_with_payload(&mut msg, hs_resp).unwrap();
+        assert_eq!(data, Bytes::from_static(b"hello"));
 
-        let mut msg = vec![];
-        let hs_resp = IkMsg1::send(&mut msg, hs_resp);
-        let hs_init = IkMsg1::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
+        let mut msg = BytesMut::new();
+        let hs_resp = IkMsg1::send_with_payload(&mut msg, hs_resp, b"goodbye");
+        let (hs_init, data) = IkMsg1::recv_with_payload(&mut msg, hs_init).unwrap();
+        assert_eq!(data, Bytes::from_static(b"goodbye"));
 
         assert_eq!(hs_init.cipher.k.0, hs_resp.cipher.k.0);
         assert_eq!(hs_init.symm.ck, hs_resp.symm.ck);
@@ -935,25 +1093,27 @@ mod tests {
     #[test]
     fn check_kx() {
         type KxPre0 = hlist![S];
-        type KxMsg0 = hlist![E];
-        type KxMsg1 = hlist![E, Ee, Se, S, Es];
+        type KxMsg0 = hlist![E, Payload];
+        type KxMsg1 = hlist![E, Ee, Se, S, Es, Payload];
 
         let hs_init = HandshakeState::initiator("Noise_KX_25519_ChaChaPoly_SHA256")
             .with_static_key(StaticSecret::random());
         let hs_resp = HandshakeState::responder("Noise_KX_25519_ChaChaPoly_SHA256")
             .with_static_key(StaticSecret::random());
 
-        let mut msg = vec![];
-        let hs_init = KxPre0::send(&mut msg, hs_init);
-        let hs_resp = KxPre0::recv(&mut BytesMut::from(&*msg), hs_resp).unwrap();
+        let mut msg = BytesMut::new();
+        let hs_init = KxPre0::send_premsg(&mut msg, hs_init);
+        let hs_resp = KxPre0::recv_premsg(&mut msg, hs_resp).unwrap();
 
-        let mut msg = vec![];
-        let hs_init = KxMsg0::send(&mut msg, hs_init);
-        let hs_resp = KxMsg0::recv(&mut BytesMut::from(&*msg), hs_resp).unwrap();
+        let mut msg = BytesMut::new();
+        let hs_init = KxMsg0::send_with_payload(&mut msg, hs_init, b"hello");
+        let (hs_resp, data) = KxMsg0::recv_with_payload(&mut msg, hs_resp).unwrap();
+        assert_eq!(data, Bytes::from_static(b"hello"));
 
-        let mut msg = vec![];
-        let hs_resp = KxMsg1::send(&mut msg, hs_resp);
-        let hs_init = KxMsg1::recv(&mut BytesMut::from(&*msg), hs_init).unwrap();
+        let mut msg = BytesMut::new();
+        let hs_resp = KxMsg1::send_with_payload(&mut msg, hs_resp, b"goodbye");
+        let (hs_init, data) = KxMsg1::recv_with_payload(&mut msg, hs_init).unwrap();
+        assert_eq!(data, Bytes::from_static(b"goodbye"));
 
         assert_eq!(hs_init.cipher.k.0, hs_resp.cipher.k.0);
         assert_eq!(hs_init.symm.ck, hs_resp.symm.ck);

@@ -16,7 +16,7 @@ hmac = "0.12"
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = [
-    'cfg(typestate_noise_vectors)',
+    'cfg(unsafe_typestate_noise_vectors)',
 ] }
 
 [dev-dependencies]
