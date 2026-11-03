@@ -3,7 +3,8 @@ use crate::crypto::{Cipher, Crypto, Dh, PublicKey};
 use super::{
     core::{Core, Message},
     states::*,
-    Complete, DhRequest, DhResult, Error, Handshake, Transport, Written, IK, XX,
+    Complete, DhRequest, DhResult, Error, Handshake, NoPsk, Psk0, Psk0And2, Psk2, PskMode,
+    PskRequest, Transport, Written, IK, XX,
 };
 
 impl XX {
@@ -43,9 +44,9 @@ impl IK {
 // Only the five sending states get these entry points. The macro keeps the
 // copying and in-place APIs on exactly the same checked transition path.
 macro_rules! writer {
-    ($step:ty, $offset:expr, $overhead:expr, [$($key:ident),*], $result:ty,
+    ([$($generics:tt)*], $mode:ty, $step:ty, $offset:expr, $overhead:expr, [$($key:ident),*], $result:ty,
         |$state:ident, $message:ident| $body:block) => {
-        impl<C: Crypto> Handshake<C, $step> {
+        impl<$($generics)*> Handshake<C, $step, $mode> {
             /// Plaintext starts here for `write_message_in_place`.
             pub const PAYLOAD_OFFSET: usize = $offset;
             /// Additional bytes required beyond the plaintext payload.
@@ -65,8 +66,8 @@ macro_rules! writer {
             }
 
             fn start_write<'a>(self, message: Message<'a>, $($key: PublicKey<C>,)*) -> Result<$result, Error> {
-                let mut $state = self;
-                let mut $message = message;
+                #[allow(unused_mut)] let mut $state = self;
+                #[allow(unused_mut)] let mut $message = message;
                 $body
             }
         }
@@ -74,40 +75,54 @@ macro_rules! writer {
 }
 
 writer!(
+    [C: Crypto, M: PskMode], M,
     XxInitiatorWrite1,
     C::Dh::PUBLIC_KEY_LEN,
-    C::Dh::PUBLIC_KEY_LEN,
+    C::Dh::PUBLIC_KEY_LEN + if M::ENABLED { C::Cipher::TAG_LEN } else { 0 },
     [],
-    Written<'a, C, XxInitiatorRead2>,
+    Written<'a, C, XxInitiatorRead2, M>,
     |state, message| {
-        message.write_e(&mut state.core)?;
-        state.core.mix_hash(&message.bytes[message.position..]);
-        Ok((state.transition(), message.bytes))
+        message.write_e::<C, M>(&mut state.core)?;
+        let bytes = if M::ENABLED {
+            // SAFETY: in PSK mode, the e token just called MixKey(e.public).
+            unsafe { message.encrypt_payload(&mut state.core)? }
+        } else {
+            state.core.mix_hash(&message.bytes[message.position..]);
+            message.bytes
+        };
+        Ok((state.transition(), bytes))
     }
 );
 
-impl<C: Crypto> Handshake<C, XxResponderRead1> {
+impl<C: Crypto, M: PskMode> Handshake<C, XxResponderRead1, M> {
     pub fn read_message<'a>(
         mut self,
         input: &'a mut [u8],
-    ) -> Result<Written<'a, C, XxResponderWrite2>, Error> {
-        let mut message = Message::read(input, C::Dh::PUBLIC_KEY_LEN)?;
-        message.read_e(&mut self.core)?;
-        let payload = &mut message.bytes[message.position..];
-        self.core.mix_hash(payload);
+    ) -> Result<Written<'a, C, XxResponderWrite2, M>, Error> {
+        let mut message = Message::read(input, Handshake::<C, XxInitiatorWrite1, M>::OVERHEAD)?;
+        message.read_e::<C, M>(&mut self.core)?;
+        let payload = if M::ENABLED {
+            // SAFETY: in PSK mode, reading e just installed its cipher key.
+            unsafe { message.decrypt_payload(&mut self.core)? }
+        } else {
+            let payload = &mut message.bytes[message.position..];
+            self.core.mix_hash(payload);
+            payload
+        };
         Ok((self.transition(), payload))
     }
 }
 
 writer!(
+    [C: Crypto, M: PskMode], M,
     XxResponderWrite2,
     2 * C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN,
     2 * C::Dh::PUBLIC_KEY_LEN + 2 * C::Cipher::TAG_LEN,
     [local_static],
-    DhRequest<'a, C, XxResponderDh2>,
+    DhRequest<'a, C, XxResponderDh2, M>,
     |state, message| {
         state.core.s = Some(local_static);
-        message.write_e(&mut state.core)?;
+        message.write_e::<C, M>(&mut state.core)?;
         // SAFETY: message 1 installed re; write_e installed e; s was set above.
         unsafe {
             state.core.ee()?;
@@ -117,25 +132,23 @@ writer!(
     }
 );
 
-impl<'a, C: Crypto> DhRequest<'a, C, XxResponderDh2> {
-    pub fn resume(
+impl<'a, C: Crypto, M: PskMode> DhRequest<'a, C, XxResponderDh2, M> {
+    fn resume_prefix(
         mut self,
         shared: DhResult<C>,
-    ) -> Result<Written<'a, C, XxResponderRead3>, Error> {
+    ) -> Result<PskRequest<'a, C, XxResponderPsk2, M>, Error> {
         self.core.mix_key(shared.0.as_ref())?;
-        // SAFETY: MixKey just installed the key for this payload.
-        let message = unsafe { self.message.encrypt_payload(&mut self.core)? };
-        Ok((Handshake::from_core(self.core), message))
+        Ok(PskRequest::new(self.core, self.message))
     }
 }
 
-impl<C: Crypto> Handshake<C, XxInitiatorRead2> {
-    pub fn read_message<'a>(
+impl<C: Crypto, M: PskMode> Handshake<C, XxInitiatorRead2, M> {
+    fn read_prefix<'a>(
         mut self,
         input: &'a mut [u8],
-    ) -> Result<Written<'a, C, XxInitiatorWrite3>, Error> {
-        let mut message = Message::read(input, Handshake::<C, XxResponderWrite2>::OVERHEAD)?;
-        message.read_e(&mut self.core)?;
+    ) -> Result<PskRequest<'a, C, XxInitiatorPsk2, M>, Error> {
+        let mut message = Message::read(input, Handshake::<C, XxResponderWrite2, M>::OVERHEAD)?;
+        message.read_e::<C, M>(&mut self.core)?;
         // SAFETY: write1 installed e, read_e installed re. ee installs the
         // cipher key; read_s then installs rs for ephemeral_static (es).
         unsafe {
@@ -143,18 +156,17 @@ impl<C: Crypto> Handshake<C, XxInitiatorRead2> {
             message.read_s(&mut self.core)?;
             self.core.ephemeral_static()?;
         }
-        // SAFETY: es installed the payload key.
-        let payload = unsafe { message.decrypt_payload(&mut self.core)? };
-        Ok((self.transition(), payload))
+        Ok(PskRequest::new(self.core, message))
     }
 }
 
 writer!(
+    [C: Crypto, M: PskMode], M,
     XxInitiatorWrite3,
     C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN,
     C::Dh::PUBLIC_KEY_LEN + 2 * C::Cipher::TAG_LEN,
     [local_static],
-    DhRequest<'a, C, XxInitiatorDh3>,
+    DhRequest<'a, C, XxInitiatorDh3, M>,
     |state, message| {
         state.core.s = Some(local_static);
         // SAFETY: s was set above and reading message 2 installed the cipher key.
@@ -165,7 +177,7 @@ writer!(
     }
 );
 
-impl<'a, C: Crypto> DhRequest<'a, C, XxInitiatorDh3> {
+impl<'a, C: Crypto, M: PskMode> DhRequest<'a, C, XxInitiatorDh3, M> {
     pub fn resume(mut self, shared: DhResult<C>) -> Result<Complete<'a, C>, Error> {
         self.core.mix_key(shared.0.as_ref())?;
         // SAFETY: MixKey just installed the payload key.
@@ -174,9 +186,9 @@ impl<'a, C: Crypto> DhRequest<'a, C, XxInitiatorDh3> {
     }
 }
 
-impl<C: Crypto> Handshake<C, XxResponderRead3> {
+impl<C: Crypto, M: PskMode> Handshake<C, XxResponderRead3, M> {
     pub fn read_message<'a>(mut self, input: &'a mut [u8]) -> Result<Complete<'a, C>, Error> {
-        let mut message = Message::read(input, Handshake::<C, XxInitiatorWrite3>::OVERHEAD)?;
+        let mut message = Message::read(input, Handshake::<C, XxInitiatorWrite3, M>::OVERHEAD)?;
         // SAFETY: message 2 installed the cipher key and local e; read_s
         // installs rs before ephemeral_static (se) is called.
         unsafe {
@@ -190,13 +202,14 @@ impl<C: Crypto> Handshake<C, XxResponderRead3> {
 }
 
 writer!(
+    [C: Crypto, M: PskMode], M,
     IkInitiatorWrite1,
     2 * C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN,
     2 * C::Dh::PUBLIC_KEY_LEN + 2 * C::Cipher::TAG_LEN,
     [],
-    DhRequest<'a, C, IkInitiatorDh1>,
+    DhRequest<'a, C, IkInitiatorDh1, M>,
     |state, message| {
-        message.write_e(&mut state.core)?;
+        message.write_e::<C, M>(&mut state.core)?;
         // SAFETY: the constructor installed rs and s; write_e installed e.
         // es installs the cipher key before the encrypted static is written.
         unsafe {
@@ -207,11 +220,11 @@ writer!(
     }
 );
 
-impl<'a, C: Crypto> DhRequest<'a, C, IkInitiatorDh1> {
+impl<'a, C: Crypto, M: PskMode> DhRequest<'a, C, IkInitiatorDh1, M> {
     pub fn resume(
         mut self,
         shared: DhResult<C>,
-    ) -> Result<Written<'a, C, IkInitiatorRead2>, Error> {
+    ) -> Result<Written<'a, C, IkInitiatorRead2, M>, Error> {
         self.core.mix_key(shared.0.as_ref())?;
         // SAFETY: MixKey just installed the payload key.
         let message = unsafe { self.message.encrypt_payload(&mut self.core)? };
@@ -219,22 +232,22 @@ impl<'a, C: Crypto> DhRequest<'a, C, IkInitiatorDh1> {
     }
 }
 
-impl<C: Crypto> Handshake<C, IkResponderRead1> {
+impl<C: Crypto, M: PskMode> Handshake<C, IkResponderRead1, M> {
     pub fn read_message<'a>(
         mut self,
         input: &'a mut [u8],
-    ) -> Result<DhRequest<'a, C, IkResponderDh1Es>, Error> {
-        let mut message = Message::read(input, Handshake::<C, IkInitiatorWrite1>::OVERHEAD)?;
-        message.read_e(&mut self.core)?;
+    ) -> Result<DhRequest<'a, C, IkResponderDh1Es, M>, Error> {
+        let mut message = Message::read(input, Handshake::<C, IkInitiatorWrite1, M>::OVERHEAD)?;
+        message.read_e::<C, M>(&mut self.core)?;
         Ok(self.pause(message)) // es: local static / remote ephemeral
     }
 }
 
-impl<'a, C: Crypto> DhRequest<'a, C, IkResponderDh1Es> {
+impl<'a, C: Crypto, M: PskMode> DhRequest<'a, C, IkResponderDh1Es, M> {
     pub fn resume(
         mut self,
         shared: DhResult<C>,
-    ) -> Result<DhRequest<'a, C, IkResponderDh1Ss>, Error> {
+    ) -> Result<DhRequest<'a, C, IkResponderDh1Ss, M>, Error> {
         self.core.mix_key(shared.0.as_ref())?;
         // SAFETY: es just installed the key needed to decrypt the peer static key.
         unsafe {
@@ -248,11 +261,11 @@ impl<'a, C: Crypto> DhRequest<'a, C, IkResponderDh1Es> {
     }
 }
 
-impl<'a, C: Crypto> DhRequest<'a, C, IkResponderDh1Ss> {
+impl<'a, C: Crypto, M: PskMode> DhRequest<'a, C, IkResponderDh1Ss, M> {
     pub fn resume(
         mut self,
         shared: DhResult<C>,
-    ) -> Result<Written<'a, C, IkResponderWrite2>, Error> {
+    ) -> Result<Written<'a, C, IkResponderWrite2, M>, Error> {
         self.core.mix_key(shared.0.as_ref())?;
         // SAFETY: ss just installed the payload key.
         let payload = unsafe { self.message.decrypt_payload(&mut self.core)? };
@@ -260,32 +273,28 @@ impl<'a, C: Crypto> DhRequest<'a, C, IkResponderDh1Ss> {
     }
 }
 
-writer!(
-    IkResponderWrite2,
-    C::Dh::PUBLIC_KEY_LEN,
-    C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN,
-    [],
-    Complete<'a, C>,
-    |state, message| {
-        message.write_e(&mut state.core)?;
+impl<C: Crypto, M: PskMode> Handshake<C, IkResponderWrite2, M> {
+    fn write_prefix<'a>(
+        mut self,
+        mut message: Message<'a>,
+    ) -> Result<PskRequest<'a, C, IkResponderPsk2, M>, Error> {
+        message.write_e::<C, M>(&mut self.core)?;
         // SAFETY: reading message 1 installed re and rs; write_e installed e.
         unsafe {
-            state.core.ee()?;
-            state.core.ephemeral_static()?; // se
+            self.core.ee()?;
+            self.core.ephemeral_static()?; // se
         }
-        // SAFETY: se installed the payload key.
-        let message = unsafe { message.encrypt_payload(&mut state.core)? };
-        Ok((Transport::from_core(state.core, false)?, message))
+        Ok(PskRequest::new(self.core, message))
     }
-);
+}
 
-impl<C: Crypto> Handshake<C, IkInitiatorRead2> {
+impl<C: Crypto, M: PskMode> Handshake<C, IkInitiatorRead2, M> {
     pub fn read_message<'a>(
         mut self,
         input: &'a mut [u8],
-    ) -> Result<DhRequest<'a, C, IkInitiatorDh2>, Error> {
-        let mut message = Message::read(input, Handshake::<C, IkResponderWrite2>::OVERHEAD)?;
-        message.read_e(&mut self.core)?;
+    ) -> Result<DhRequest<'a, C, IkInitiatorDh2, M>, Error> {
+        let mut message = Message::read(input, C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN)?;
+        message.read_e::<C, M>(&mut self.core)?;
         // SAFETY: writing message 1 installed e, and read_e just installed re.
         unsafe {
             self.core.ee()?;
@@ -294,11 +303,71 @@ impl<C: Crypto> Handshake<C, IkInitiatorRead2> {
     }
 }
 
-impl<'a, C: Crypto> DhRequest<'a, C, IkInitiatorDh2> {
-    pub fn resume(mut self, shared: DhResult<C>) -> Result<Complete<'a, C>, Error> {
+impl<'a, C: Crypto, M: PskMode> DhRequest<'a, C, IkInitiatorDh2, M> {
+    fn resume_prefix(
+        mut self,
+        shared: DhResult<C>,
+    ) -> Result<PskRequest<'a, C, IkInitiatorPsk2, M>, Error> {
         self.core.mix_key(shared.0.as_ref())?;
-        // SAFETY: se just installed the payload key.
-        let payload = unsafe { self.message.decrypt_payload(&mut self.core)? };
-        Ok((Transport::from_core(self.core, true)?, payload))
+        Ok(PskRequest::new(self.core, self.message))
     }
 }
+
+// The message-2 prefixes are identical across modes. Only modes carrying a psk2
+// token return a public PSK request; the others immediately process the payload.
+macro_rules! without_psk2 {
+    ($mode:ty) => {
+        impl<'a, C: Crypto> DhRequest<'a, C, XxResponderDh2, $mode> {
+            pub fn resume(self, shared: DhResult<C>) -> Result<Written<'a, C, XxResponderRead3, $mode>, Error> {
+                self.resume_prefix(shared)?.finish()
+            }
+        }
+        impl<C: Crypto> Handshake<C, XxInitiatorRead2, $mode> {
+            pub fn read_message<'a>(self, input: &'a mut [u8]) -> Result<Written<'a, C, XxInitiatorWrite3, $mode>, Error> {
+                self.read_prefix(input)?.finish()
+            }
+        }
+        writer!([C: Crypto], $mode, IkResponderWrite2,
+            C::Dh::PUBLIC_KEY_LEN, C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN,
+            [], Complete<'a, C>, |state, message| {
+                state.write_prefix(message)?.finish()
+            }
+        );
+        impl<'a, C: Crypto> DhRequest<'a, C, IkInitiatorDh2, $mode> {
+            pub fn resume(self, shared: DhResult<C>) -> Result<Complete<'a, C>, Error> {
+                self.resume_prefix(shared)?.finish()
+            }
+        }
+    };
+}
+
+macro_rules! with_psk2 {
+    ($mode:ty) => {
+        impl<'a, C: Crypto> DhRequest<'a, C, XxResponderDh2, $mode> {
+            pub fn resume(self, shared: DhResult<C>) -> Result<PskRequest<'a, C, XxResponderPsk2, $mode>, Error> {
+                self.resume_prefix(shared)
+            }
+        }
+        impl<C: Crypto> Handshake<C, XxInitiatorRead2, $mode> {
+            pub fn read_message<'a>(self, input: &'a mut [u8]) -> Result<PskRequest<'a, C, XxInitiatorPsk2, $mode>, Error> {
+                self.read_prefix(input)
+            }
+        }
+        writer!([C: Crypto], $mode, IkResponderWrite2,
+            C::Dh::PUBLIC_KEY_LEN, C::Dh::PUBLIC_KEY_LEN + C::Cipher::TAG_LEN,
+            [], PskRequest<'a, C, IkResponderPsk2, $mode>, |state, message| {
+                state.write_prefix(message)
+            }
+        );
+        impl<'a, C: Crypto> DhRequest<'a, C, IkInitiatorDh2, $mode> {
+            pub fn resume(self, shared: DhResult<C>) -> Result<PskRequest<'a, C, IkInitiatorPsk2, $mode>, Error> {
+                self.resume_prefix(shared)
+            }
+        }
+    };
+}
+
+without_psk2!(NoPsk);
+without_psk2!(Psk0);
+with_psk2!(Psk2);
+with_psk2!(Psk0And2);
