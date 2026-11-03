@@ -1,4 +1,4 @@
-//! Boxed, consuming typestates for Noise XX and IK.
+//! Boxed, consuming typestates for Noise XX and IK, with PSK0/PSK2 modifiers.
 //!
 //! Message framing and I/O belong to the application. A read accepts exactly one
 //! complete Noise message. Writes have both a copying convenience method and an
@@ -39,9 +39,44 @@
 //!     let _ = request.resume(DhResult::new([0; 32]));
 //! }
 //! ```
+//!
+//! PSK0 is required before the first message:
+//! ```compile_fail
+//! use typestate_noise::{crypto::DefaultCrypto, handshake::XX};
+//! let state = XX::initiator_psk0::<DefaultCrypto>(b"");
+//! ```
+//! PSK2 pauses before processing message 2's payload; it cannot be skipped:
+//! ```compile_fail
+//! use typestate_noise::{crypto::DefaultCrypto, handshake::{XX, Handshake, Psk2, states::XxInitiatorRead2}};
+//! fn skip(state: Handshake<DefaultCrypto, XxInitiatorRead2, Psk2>, wire: &mut [u8]) {
+//!     let (_next, _payload) = state.read_message(wire).unwrap();
+//! }
+//! ```
+//! PSK modes cannot be erased to disable ephemeral-key mixing:
+//! ```compile_fail
+//! use typestate_noise::{crypto::DefaultCrypto, handshake::{XX, Handshake, states::XxInitiatorWrite1}};
+//! let state = XX::initiator_psk2::<DefaultCrypto>(b"").unwrap();
+//! let plain: Handshake<DefaultCrypto, XxInitiatorWrite1> = state;
+//! ```
+//! PSKs have the fixed Noise length, independent of hash or DH output sizes:
+//! ```compile_fail
+//! use typestate_noise::handshake::Psk;
+//! let psk = Psk::new([0; 16]);
+//! ```
+//! A PSK token is consumed exactly once:
+//! ```compile_fail
+//! use typestate_noise::{crypto::DefaultCrypto, handshake::{Psk, PskRequest, states::XxInitiatorPsk2}};
+//! fn twice(request: PskRequest<'_, DefaultCrypto, XxInitiatorPsk2>) {
+//!     let _ = request.provide_psk(Psk::new([0; 32]));
+//!     let _ = request.provide_psk(Psk::new([0; 32]));
+//! }
+//! ```
 
 mod core;
 mod patterns;
+mod psk;
+
+pub use psk::{NoPsk, Psk, Psk0, Psk0And2, Psk2, PskMode, PskRequest};
 
 use std::{fmt, marker::PhantomData};
 
@@ -71,12 +106,12 @@ impl std::error::Error for Error {}
 
 /// An affine handshake capability. State changes retain the same core allocation.
 #[must_use]
-pub struct Handshake<C: Crypto, Step> {
+pub struct Handshake<C: Crypto, Step, M: PskMode = NoPsk> {
     core: Box<Core<C>>,
-    step: PhantomData<Step>,
+    step: PhantomData<(Step, M)>,
 }
 
-impl<C: Crypto, Step> Handshake<C, Step> {
+impl<C: Crypto, Step, M: PskMode> Handshake<C, Step, M> {
     fn from_core(core: Box<Core<C>>) -> Self {
         Self {
             core,
@@ -84,11 +119,11 @@ impl<C: Crypto, Step> Handshake<C, Step> {
         }
     }
 
-    fn transition<Next>(self) -> Handshake<C, Next> {
+    fn transition<Next>(self) -> Handshake<C, Next, M> {
         Handshake::from_core(self.core)
     }
 
-    fn pause<'a, Next>(self, message: Message<'a>) -> DhRequest<'a, C, Next> {
+    fn pause<'a, Next>(self, message: Message<'a>) -> DhRequest<'a, C, Next, M> {
         DhRequest {
             core: self.core,
             message,
@@ -109,10 +144,10 @@ impl<C: Crypto> DhResult<C> {
 /// A single outstanding static-key DH. It may be held across an `.await`.
 /// Dropping it abandons the handshake and releases its borrowed buffer.
 #[must_use]
-pub struct DhRequest<'a, C: Crypto, Step> {
+pub struct DhRequest<'a, C: Crypto, Step, M: PskMode = NoPsk> {
     core: Box<Core<C>>,
     message: Message<'a>,
-    step: PhantomData<Step>,
+    step: PhantomData<(Step, M)>,
 }
 
 mod sealed {
@@ -124,7 +159,7 @@ pub trait StaticDhStep: sealed::Sealed {
     const REMOTE_STATIC: bool;
 }
 
-impl<C: Crypto, Step: StaticDhStep> DhRequest<'_, C, Step> {
+impl<C: Crypto, Step: StaticDhStep, M: PskMode> DhRequest<'_, C, Step, M> {
     /// Public key identifying the local static credential to use.
     pub fn local_public_key(&self) -> &PublicKey<C> {
         // SAFETY: every pause constructor installs/retains the local static key.
@@ -142,7 +177,7 @@ impl<C: Crypto, Step: StaticDhStep> DhRequest<'_, C, Step> {
     }
 }
 
-pub type Written<'a, C, S> = (Handshake<C, S>, &'a mut [u8]);
+pub type Written<'a, C, S, M = NoPsk> = (Handshake<C, S, M>, &'a mut [u8]);
 pub type Complete<'a, C> = (Transport<C>, &'a mut [u8]);
 
 /// Transport keys, final handshake hash and peer static identity.
@@ -223,6 +258,10 @@ pub mod states {
     pub struct IkResponderDh1Es;
     pub struct IkResponderDh1Ss;
     pub struct IkResponderWrite2;
+    pub struct XxInitiatorPsk2;
+    pub struct XxResponderPsk2;
+    pub struct IkInitiatorPsk2;
+    pub struct IkResponderPsk2;
 }
 
 macro_rules! dh_step {

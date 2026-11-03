@@ -2,7 +2,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::{Cipher, CipherKey, Crypto, Dh, EphemeralSecret, Hash, HashOutput, PublicKey};
 
-use super::Error;
+use super::{Error, Psk, PskMode};
 
 pub(super) const MAX_MESSAGE: usize = 65_535;
 
@@ -100,6 +100,14 @@ fn hkdf2<C: Crypto>(
     (first, second)
 }
 
+fn hkdf3<C: Crypto>(ck: &HashOutput<C>, input: &[u8]) -> [Zeroizing<HashOutput<C>>; 3] {
+    let temp = Zeroizing::new(C::Hash::hmac(ck.as_ref(), &[input]));
+    let first = Zeroizing::new(C::Hash::hmac(temp.as_ref(), &[&[1]]));
+    let second = Zeroizing::new(C::Hash::hmac(temp.as_ref(), &[first.as_ref(), &[2]]));
+    let third = Zeroizing::new(C::Hash::hmac(temp.as_ref(), &[second.as_ref(), &[3]]));
+    [first, second, third]
+}
+
 impl<C: Crypto> Core<C> {
     pub fn new(pattern: &'static str, prologue: &[u8]) -> Result<Box<Self>, Error> {
         if C::Hash::LEN < C::Cipher::KEY_LEN || C::Dh::PUBLIC_KEY_LEN == 0 {
@@ -151,6 +159,15 @@ impl<C: Crypto> Core<C> {
         let (ck, key) = hkdf2::<C>(&self.symmetric.ck, input);
         let key = C::Cipher::key(&key.as_ref()[..C::Cipher::KEY_LEN])?;
         self.symmetric.ck.as_mut().copy_from_slice(ck.as_ref());
+        self.symmetric.cipher.set_key(key);
+        Ok(())
+    }
+
+    pub fn mix_psk(&mut self, psk: Psk) -> Result<(), Error> {
+        let [ck, hash, key] = hkdf3::<C>(&self.symmetric.ck, psk.0.as_ref());
+        let key = C::Cipher::key(&key.as_ref()[..C::Cipher::KEY_LEN])?;
+        self.symmetric.ck.as_mut().copy_from_slice(ck.as_ref());
+        self.mix_hash(hash.as_ref());
         self.symmetric.cipher.set_key(key);
         Ok(())
     }
@@ -273,20 +290,26 @@ impl<'a> Message<'a> {
         Ok(field)
     }
 
-    pub fn write_e<C: Crypto>(&mut self, core: &mut Core<C>) -> Result<(), Error> {
+    pub fn write_e<C: Crypto, M: PskMode>(&mut self, core: &mut Core<C>) -> Result<(), Error> {
         core.generate()?;
         // SAFETY: generate just installed the local ephemeral keypair.
         let public = unsafe { &present(&core.e).public };
         let field = self.take(C::Dh::PUBLIC_KEY_LEN)?;
         field.copy_from_slice(public.as_ref());
         core.mix_hash(field);
+        if M::ENABLED {
+            core.mix_key(field)?;
+        }
         Ok(())
     }
 
-    pub fn read_e<C: Crypto>(&mut self, core: &mut Core<C>) -> Result<(), Error> {
+    pub fn read_e<C: Crypto, M: PskMode>(&mut self, core: &mut Core<C>) -> Result<(), Error> {
         let field = self.take(C::Dh::PUBLIC_KEY_LEN)?;
         core.re = Some(C::Dh::parse_public(field)?);
         core.mix_hash(field);
+        if M::ENABLED {
+            core.mix_key(field)?;
+        }
         Ok(())
     }
 
